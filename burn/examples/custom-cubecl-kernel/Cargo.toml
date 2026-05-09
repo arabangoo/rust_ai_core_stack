@@ -1,0 +1,28 @@
+[package]
+authors = ["nathanielsimard <nathaniel.simard.42@gmail.com>"]
+edition.workspace = true
+license.workspace = true
+name = "custom-cubecl-kernel"
+publish = false
+version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+burn = { workspace = true, features = [
+    "autodiff",
+    "wgpu",
+    "autotune",
+    "template",
+] }
+burn-cubecl = { workspace = true, features = ["default"] }
+cubecl = { workspace = true, features = ["wgpu"] }
+
+# Serialization
+log = { workspace = true }
+serde = { workspace = true, features = ["std", "derive"] }
+
+# Wgpu internal dependencies
+bytemuck = { workspace = true }
+derive-new = { workspace = true }

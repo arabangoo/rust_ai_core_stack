@@ -1,0 +1,30 @@
+[package]
+authors = ["laggui <lagrange.guillaume.1@gmail.com>"]
+edition.workspace = true
+license.workspace = true
+name = "custom-image-dataset"
+description = "Example implementation for loading a custom image dataset from disk"
+publish = false
+version.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = ["burn/std", "burn/tui"]
+tch-gpu = ["burn/tch"]
+wgpu = ["burn/wgpu", "burn/fusion"]
+metal = ["burn/metal", "burn/fusion"]
+
+[dependencies]
+# Disable autotune default for now (convolutions not optimized)
+burn = { workspace = true, features = [
+    "train",
+    "vision",
+    "network",
+] }
+
+
+# File download
+flate2 = { workspace = true }
+tar = { workspace = true }

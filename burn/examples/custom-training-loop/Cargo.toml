@@ -1,0 +1,22 @@
+[package]
+authors = ["nathanielsimard <nathaniel.simard.42@gmail.com>"]
+edition.workspace = true
+license.workspace = true
+name = "custom-training-loop"
+publish = false
+version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+burn = {workspace = true, features=["default", "autodiff", "webgpu", "vision"] }
+guide = {path = "../guide"}
+
+# Serialization
+log = {workspace = true}
+serde = {workspace = true, features = ["std", "derive"] }
+
+# Wgpu internal dependencies
+derive-new = { workspace = true }
+bytemuck = { workspace = true }

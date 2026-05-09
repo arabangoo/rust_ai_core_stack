@@ -1,0 +1,15 @@
+target/
+.DS_Store
+.idea/
+.vscode/
+.devcontainer/
+.fastembed_cache/
+
+# env
+.env
+.envrc
+.direnv
+
+# nodejs stuff
+node_modules/
+dist/

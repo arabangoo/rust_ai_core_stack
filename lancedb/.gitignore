@@ -1,0 +1,41 @@
+.idea
+*.swp
+**/*.whl
+*.egg-info
+**/__pycache__
+.DS_Store
+venv
+.venv
+
+.vscode
+.zed
+rust/target
+
+site
+
+.pytest_cache
+.ruff_cache
+
+python/build
+python/dist
+
+**/.ipynb_checkpoints
+
+**/.hypothesis
+
+# Compiled Dynamic libraries
+*.so
+*.dylib
+*.dll
+
+## Javascript
+*.node
+**/node_modules
+**/.DS_Store
+nodejs/lancedb/native*
+dist
+
+## Rust
+target
+
+**/sccache.log

@@ -1,0 +1,56 @@
+[package]
+authors = ["nathanielsimard <nathaniel.simard.42@gmail.com>"]
+categories = ["science"]
+description = "WGPU backend for the Burn framework"
+documentation = "https://docs.rs/burn-wgpu"
+edition.workspace = true
+keywords = ["deep-learning", "machine-learning", "gpu", "wgpu", "webgpu"]
+license.workspace = true
+name = "burn-wgpu"
+readme.workspace = true
+repository = "https://github.com/tracel-ai/burn/tree/main/crates/burn-wgpu"
+version.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = ["std", "autotune", "fusion", "burn-cubecl/default", "cubecl/default"]
+doc = ["burn-cubecl/doc"]
+std = ["burn-cubecl/std", "cubecl/std"]
+tracing = [
+    "cubecl/tracing",
+    "burn-backend/tracing",
+    "burn-fusion?/tracing",
+    "burn-cubecl/tracing",
+]
+
+autotune = ["burn-cubecl/autotune"]
+autotune-checks = ["burn-cubecl/autotune-checks"]
+exclusive-memory-only = ["cubecl/exclusive-memory-only"]
+fusion = ["burn-fusion", "burn-cubecl/fusion"]
+template = ["burn-cubecl/template", "cubecl/template"]
+
+# Backends
+metal = ["cubecl-msl"]
+vulkan = ["cubecl-spirv"]
+webgpu = ["cubecl-wgsl"]
+
+# Compilers
+cubecl-msl = ["cubecl/wgpu-msl"]
+cubecl-spirv = ["cubecl/wgpu-spirv"]
+cubecl-wgsl = []
+
+[dependencies]
+cubecl = { workspace = true, features = ["wgpu"] }
+
+burn-cubecl = { workspace = true }
+burn-fusion = { workspace = true, optional = true, features = ["default"] }
+burn-backend = { workspace = true, features = [
+    "cubecl-wgpu",
+] }
+
+
+[package.metadata.docs.rs]
+features = ["default"]
+rustdoc-args = ["--cfg", "docsrs"]
