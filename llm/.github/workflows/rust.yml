@@ -1,0 +1,172 @@
+name: Rust
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    strategy:
+      # Don't stop building if it fails on an OS
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          submodules: recursive
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: 1.65.0
+          override: true
+      - name: Check
+        run: cargo check --verbose
+      - name: Build
+        run: cargo build --verbose
+      - name: Run tests
+        run: cargo test --all --verbose
+  fmt:
+    name: Clippy, formatting and docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          submodules: recursive
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - name: Formatting
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --workspace -- -Dclippy::all
+      - name: Documentation
+        env:
+          RUSTDOCFLAGS: -Dwarnings
+        run: cargo doc --workspace --exclude llm-cli
+
+  metal:
+    name: Build with Metal support
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          submodules: recursive
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: 1.65.0
+          override: true
+      - name: Check
+        run: cargo check --verbose
+      - name: Build
+        run: cargo build --verbose --features metal
+
+  cuda:
+    name: Build with CUDA support
+    strategy:
+      # Don't stop building if it fails on an OS
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          submodules: recursive
+      - uses: Jimver/cuda-toolkit@v0.2.11
+        name: Install CUDA toolkit on Linux
+        if: matrix.os == 'ubuntu-latest'
+        id: cuda-toolkit-linux
+        with:
+          cuda: "12.2.0"
+          method: "network"
+          #See e.g. https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/
+          non-cuda-sub-packages: '["libcublas","libcublas-dev"]'
+          sub-packages: '["nvcc","compiler","libraries","libraries-dev","cudart","cudart-dev"]'
+
+      - uses: Jimver/cuda-toolkit@v0.2.11
+        name: Install CUDA toolkit on Windows
+        if: matrix.os == 'windows-latest'
+        id: cuda-toolkit-windows
+        with:
+          cuda: "12.2.0"
+          #See https://docs.nvidia.com/cuda/cuda-installation-guide-microsoft-windows/index.html#install-the-cuda-software
+          method: "local"
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: 1.65.0
+          override: true
+      - name: Check
+        run: cargo check --verbose
+      - name: Build
+        run: cargo build --verbose --features cublas
+
+  opencl:
+    name: Build with OpenCL support
+    strategy:
+      # Don't stop building if it fails on an OS
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          submodules: recursive
+
+      - name: Install CLBlast on linux
+        if: matrix.os == 'ubuntu-latest'
+        run: sudo apt install libclblast-dev
+
+      - name: Install vcpkg on windows
+        if: matrix.os == 'windows-latest'
+        run: |
+          git clone https://github.com/microsoft/vcpkg.git
+          cd vcpkg
+          ./bootstrap-vcpkg.sh
+          ls -la
+        shell: bash
+
+      - name: Install OpenCL on windows
+        if: matrix.os == 'windows-latest'
+        run: |
+          ${{ github.workspace }}\vcpkg\vcpkg.exe install opencl:x64-windows
+        shell: pwsh
+
+      - name: Install CLBlast on windows
+        if: matrix.os == 'windows-latest'
+        run: |
+          ${{ github.workspace }}\vcpkg\vcpkg.exe install clblast:x64-windows
+        shell: pwsh
+
+      - name: Set Windows Environment Variables
+        if: matrix.os == 'windows-latest'
+        run: |
+          echo "CLBLAST_PATH=${{ github.workspace }}/vcpkg/packages/clblast_x64-windows" >> $GITHUB_ENV
+          echo "OPENCL_PATH=${{ github.workspace }}/vcpkg/packages/opencl_x64-windows" >> $GITHUB_ENV
+          echo "${{ github.workspace }}/vcpkg/packages/clblast_x64-windows/bin" >> $GITHUB_PATH
+          echo "${{ github.workspace }}/vcpkg/packages/opencl_x64-windows/bin" >> $GITHUB_PATH
+        shell: bash
+
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: 1.65.0
+          override: true
+      - name: Check
+        run: cargo check --verbose
+
+      - name: Build with OpenCL on Windows
+        if: matrix.os == 'windows-latest'
+        run: cargo build --verbose --features clblast
+        env:
+          RUSTFLAGS: "-Ctarget-feature=+crt-static"
+
+      - name: Build with OpenCL on Linux
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo build --verbose --features clblast
