@@ -342,6 +342,52 @@ fn pdf_basic() {
 
 #[cfg(feature = "pdf")]
 #[test]
+fn pdf_layout_detects_heading_by_font_size() {
+    use lopdf::content::{Content, Operation};
+    use lopdf::{dictionary, Document, Object, Stream};
+
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let font_id = doc.add_object(dictionary! {
+        "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Helvetica",
+    });
+    let resources_id = doc.add_object(dictionary! { "Font" => dictionary! { "F1" => font_id } });
+    // 큰 폰트(24) 한 줄 + 작은 폰트(10) 본문 한 줄.
+    let content = Content {
+        operations: vec![
+            Operation::new("BT", vec![]),
+            Operation::new("Tf", vec!["F1".into(), 24.into()]),
+            Operation::new("Td", vec![72.into(), 700.into()]),
+            Operation::new("Tj", vec![Object::string_literal("Big Heading")]),
+            Operation::new("Tf", vec!["F1".into(), 10.into()]),
+            Operation::new("Td", vec![0.into(), (-40).into()]),
+            Operation::new("Tj", vec![Object::string_literal("This is body text content")]),
+            Operation::new("ET", vec![]),
+        ],
+    };
+    let content_id = doc.add_object(Stream::new(dictionary! {}, content.encode().unwrap()));
+    let page_id = doc.add_object(dictionary! {
+        "Type" => "Page", "Parent" => pages_id, "Contents" => content_id,
+        "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        "Resources" => resources_id,
+    });
+    let pages = dictionary! { "Type" => "Pages", "Kids" => vec![page_id.into()], "Count" => 1 };
+    doc.objects.insert(pages_id, Object::Dictionary(pages));
+    let catalog_id = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+    doc.trailer.set("Root", catalog_id);
+
+    let mut buf = Vec::new();
+    doc.save_to(&mut buf).unwrap();
+
+    let md = convert(buf, "pdf", "layout.pdf");
+    assert!(md.contains("# Big Heading"), "큰 폰트 → 헤딩:\n{md}");
+    assert!(md.contains("This is body text content"), "본문 텍스트:\n{md}");
+    // 본문은 헤딩(#)으로 잡히면 안 됨.
+    assert!(!md.contains("# This is body"), "본문이 헤딩으로 오인되면 안 됨:\n{md}");
+}
+
+#[cfg(feature = "pdf")]
+#[test]
 fn pdf_magic_bytes_detected() {
     use rust_markdown_transformer::FormatParser;
     let p = rust_markdown_transformer::parsers::PdfParser;

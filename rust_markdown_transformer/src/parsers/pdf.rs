@@ -41,8 +41,18 @@ impl FormatParser for PdfParser {
         input.read_to_end(&mut buf)?;
 
         let mut metadata = DocumentMetadata::new(SourceFormat::Pdf, filename);
-        extract_metadata(&buf, &mut metadata);
 
+        // 1차: layout 레이어 (좌표·폰트크기 기반 헤딩 + XY-Cut 읽기순서).
+        //      doc 를 한 번 로드해 메타데이터와 layout 모두에 재사용.
+        if let Ok(doc) = lopdf::Document::load_mem(&buf) {
+            fill_metadata(&doc, &mut metadata);
+            let blocks = super::pdf_layout::layout_blocks(&doc);
+            if !blocks.is_empty() {
+                return Ok(Document { metadata, blocks });
+            }
+        }
+
+        // 2차(fallback): 텍스트 레이어가 없거나 layout 실패 → 단순 텍스트 추출.
         // pdf-extract 가 일부 손상 PDF 에서 panic 할 수 있어 격리한다 (README §1-1).
         let text = std::panic::catch_unwind(|| pdf_extract::extract_text_from_mem(&buf))
             .map_err(|_| ParseError::container(FMT, "pdf-extract panicked on malformed PDF"))?
@@ -53,12 +63,11 @@ impl FormatParser for PdfParser {
     }
 }
 
-/// lopdf 로 /Info(Title/Author) + 페이지 수 추출 (best-effort, 실패해도 무시).
-fn extract_metadata(buf: &[u8], meta: &mut DocumentMetadata) {
-    let Ok(doc) = lopdf::Document::load_mem(buf) else { return };
+/// lopdf Document 에서 /Info(Title/Author) + 페이지 수 추출 (best-effort).
+fn fill_metadata(doc: &lopdf::Document, meta: &mut DocumentMetadata) {
     meta.page_count = Some(doc.get_pages().len());
-    meta.title = info_field(&doc, b"Title");
-    meta.author = info_field(&doc, b"Author");
+    meta.title = info_field(doc, b"Title");
+    meta.author = info_field(doc, b"Author");
 }
 
 fn info_field(doc: &lopdf::Document, key: &[u8]) -> Option<String> {

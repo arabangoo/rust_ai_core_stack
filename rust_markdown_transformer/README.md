@@ -331,7 +331,7 @@ pub enum ConvertError {                // 레지스트리 상위 API 에러
 | **PPTX** | `pptx` | `zip`+`quick-xml` | 슬라이드별 제목→h2, 본문 단락, **굵게/기울임**, 슬라이드 경계→PageBreak, 슬라이드 수 | 표/도형/발표자 노트 미추출 |
 | **XLSX** | `xlsx` `xlsm` | `calamine` | 시트별 제목→h2, 사용영역→표, 빈 행/열 trim | 병합셀은 첫 셀 값만, 수식은 계산값(문자열) |
 | **HWPX** | `hwpx` | `zip`+`quick-xml` | 헤딩(header.xml `Outline N`), 단락, 표, 제목(content.hpf) | 글자모양(굵게/기울임)은 charPr 참조라 미보존, 이미지 미추출 |
-| **PDF** | `pdf` | `pdf-extract`+`lopdf` | 본문 텍스트(**한글 CID/ToUnicode 포함**), 단락, 제목/작성자/페이지 수 | **헤딩 복원·reading-order 미지원**(향후 과제), 표 미복원, 스캔 PDF는 빈 문서 |
+| **PDF** | `pdf` | `pdf-extract`+`lopdf` | 본문 텍스트(**한글 CID/ToUnicode 포함**), **폰트크기 기반 헤딩**, **XY-Cut 읽기순서(다단 분리)**, 단락, 제목/작성자/페이지 수 | 표 미복원, 복잡 비정형(매거진) 레이아웃 정확도 보통, 스캔 PDF는 빈 문서(fallback) |
 | **HTML** | `html` `htm` `xhtml` | `scraper` | `<article>/<main>/<body>` 우선, 헤딩/단락/목록(중첩)/표/코드/인용/이미지/링크/강조 | `<script>/<style>/<nav>/<header>/<footer>/<aside>` 제거, JS 렌더링 미지원 |
 | **Markdown** | `md` `markdown` `mdown` `mkd` | `pulldown-cmark` | 헤딩/단락/목록/표/코드/인용/링크/이미지/강조 **재정규화** | 각주/수식/raw HTML 블록 미처리 |
 
