@@ -8,6 +8,12 @@
 이 문서는 라이브러리의 **완결된 개발자 매뉴얼**이다. 설계 철학, 공개 API, 지원 포맷별 동작과 한계,
 CLI/Python 사용법, 새 포맷 추가 방법, 빌드/테스트 절차를 모두 담는다.
 
+[주요 참고 논문]
+
+1. XY-Cut++: Advanced Layout Ordering via Hierarchical Mask Mechanism on a Novel Benchmark - https://arxiv.org/abs/2504.10258
+2. LayoutReader: Pre-training of Text and Layout for Reading Order Detection - https://arxiv.org/abs/2108.11591
+3. Nougat: Neural Optical Understanding for Academic Documents - https://arxiv.org/abs/2308.13418
+
 ---
 
 ## 목차
