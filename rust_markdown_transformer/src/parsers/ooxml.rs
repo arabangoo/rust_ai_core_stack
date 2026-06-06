@@ -8,6 +8,11 @@
 use std::collections::HashMap;
 use std::io::{Cursor, Read};
 
+#[cfg(any(feature = "docx", feature = "pptx"))]
+use quick_xml::events::Event;
+#[cfg(any(feature = "docx", feature = "pptx"))]
+use quick_xml::reader::Reader;
+
 use crate::error::ParseError;
 
 /// 풀어놓은 OOXML 패키지 — 엔트리 경로 → 바이트.
@@ -40,10 +45,20 @@ impl OoxmlPackage {
         Ok(OoxmlPackage { entries })
     }
 
-    /// 엔트리 raw 바이트. (이미지 등 바이너리 파트 추출용 — v0.1 미사용이나 공개 API 로 유지)
+    /// 엔트리 raw 바이트 (이미지 등 바이너리 파트 추출용).
     #[allow(dead_code)]
     pub fn get(&self, name: &str) -> Option<&[u8]> {
         self.entries.get(name).map(Vec::as_slice)
+    }
+
+    /// 경로가 `suffix` 로 끝나는 첫 엔트리의 바이트. HWPX 매니페스트 href 가 패키지 루트
+    /// 기준인지 Contents 기준인지 변동될 때의 폴백 해석용.
+    #[cfg(feature = "hwpx")]
+    pub fn get_by_suffix(&self, suffix: &str) -> Option<&[u8]> {
+        self.entries
+            .iter()
+            .find(|(k, _)| k.ends_with(suffix))
+            .map(|(_, v)| v.as_slice())
     }
 
     /// 엔트리를 UTF-8 문자열로 (OOXML 파트는 UTF-8).
@@ -72,6 +87,113 @@ impl OoxmlPackage {
         names.sort_by(|a, b| natural_cmp(a, b));
         names
     }
+
+    /// 파트(`part_path`, 예 `word/document.xml` / `ppt/slides/slide1.xml`)의 관계 파일
+    /// (`<dir>/_rels/<file>.rels`)을 읽어 **relationship Id → 해석된 패키지 파트 경로** 맵 반환.
+    /// 관계 파일이 없으면 빈 맵.
+    #[cfg(any(feature = "docx", feature = "pptx"))]
+    pub fn rels_for(
+        &self,
+        part_path: &str,
+        fmt: &'static str,
+    ) -> Result<HashMap<String, String>, ParseError> {
+        let (dir, file) = match part_path.rsplit_once('/') {
+            Some((d, f)) => (d, f),
+            None => ("", part_path),
+        };
+        let rels_path = if dir.is_empty() {
+            format!("_rels/{file}.rels")
+        } else {
+            format!("{dir}/_rels/{file}.rels")
+        };
+
+        let mut map = HashMap::new();
+        let xml = match self.get_str(&rels_path, fmt)? {
+            Some(x) => x,
+            None => return Ok(map),
+        };
+
+        let mut reader = Reader::from_str(&xml);
+        loop {
+            match reader.read_event() {
+                Ok(Event::Eof) => break,
+                Ok(Event::Empty(e)) | Ok(Event::Start(e))
+                    if e.name().as_ref() == b"Relationship" =>
+                {
+                    let mut id = None;
+                    let mut target = None;
+                    let mut external = false;
+                    for a in e.attributes().flatten() {
+                        match a.key.as_ref() {
+                            b"Id" => id = a.unescape_value().ok().map(|v| v.to_string()),
+                            b"Target" => target = a.unescape_value().ok().map(|v| v.to_string()),
+                            b"TargetMode" => {
+                                external =
+                                    a.unescape_value().map(|v| v == "External").unwrap_or(false);
+                            }
+                            _ => {}
+                        }
+                    }
+                    if let (Some(id), Some(target)) = (id, target) {
+                        let resolved =
+                            if external { target } else { resolve_relative(dir, &target) };
+                        map.insert(id, resolved);
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => return Err(ParseError::markup(fmt, format!("{rels_path}: {e}"))),
+            }
+        }
+        Ok(map)
+    }
+
+    /// `rels_for` 결과 중 **이미지 파트만** 골라
+    /// relationship Id → (alt stem, base64 [`ImageData`](crate::ir::ImageData)) 로 변환.
+    /// 파서는 본문 XML 에서 만난 `r:embed`/`r:id` 로 이 맵을 조회해 `Block::Image` 를 만든다.
+    #[cfg(any(feature = "docx", feature = "pptx"))]
+    pub fn image_rels(
+        &self,
+        part_path: &str,
+        fmt: &'static str,
+    ) -> Result<HashMap<String, (String, crate::ir::ImageData)>, ParseError> {
+        let rels = self.rels_for(part_path, fmt)?;
+        let mut out = HashMap::new();
+        for (id, target) in rels {
+            let mime = super::media::mime_from_path(&target);
+            if !mime.starts_with("image/") {
+                continue;
+            }
+            if let Some(bytes) = self.get(&target) {
+                let data = crate::ir::ImageData::Base64 {
+                    mime: mime.to_string(),
+                    data: super::media::base64_encode(bytes),
+                };
+                out.insert(id, (super::media::stem_of(&target), data));
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// `.rels` 의 상대 Target 을 패키지 절대 파트 경로로 해석 (`..`/`.`/선두 `/` 처리).
+/// 예: base_dir=`ppt/slides`, target=`../media/image1.png` → `ppt/media/image1.png`.
+#[cfg(any(feature = "docx", feature = "pptx"))]
+fn resolve_relative(base_dir: &str, target: &str) -> String {
+    if let Some(stripped) = target.strip_prefix('/') {
+        return stripped.to_string();
+    }
+    let mut parts: Vec<&str> =
+        if base_dir.is_empty() { Vec::new() } else { base_dir.split('/').collect() };
+    for seg in target.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            s => parts.push(s),
+        }
+    }
+    parts.join("/")
 }
 
 /// 숫자 구간을 수치로 비교하는 자연 정렬 (slide2 < slide10).

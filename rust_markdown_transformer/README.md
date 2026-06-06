@@ -331,19 +331,21 @@ pub enum ConvertError {                // 레지스트리 상위 API 에러
 
 ## 7. 지원 포맷별 동작과 한계
 
-| 포맷 | 확장자 | 구현 엔진 | 추출 항목 | 현재 한계 |
-|---|---|---|---|---|
-| **DOCX** | `docx` | `zip`+`quick-xml` | 헤딩(styles.xml 매핑), 단락, **굵게/기울임/취소선**, 표, 목록, 제목/작성자(core.xml) | 번호 목록은 비순서로 취급, 하이퍼링크 텍스트만, 이미지 미추출 |
-| **PPTX** | `pptx` | `zip`+`quick-xml` | 슬라이드별 제목→h2, 본문 단락, **굵게/기울임**, 슬라이드 경계→PageBreak, 슬라이드 수 | 표/도형/발표자 노트 미추출 |
-| **XLSX** | `xlsx` `xlsm` | `calamine` | 시트별 제목→h2, 사용영역→표, 빈 행/열 trim | 병합셀은 첫 셀 값만, 수식은 계산값(문자열) |
-| **HWPX** | `hwpx` | `zip`+`quick-xml` | 헤딩(header.xml `Outline N`), 단락, 표, 제목(content.hpf) | 글자모양(굵게/기울임)은 charPr 참조라 미보존, 이미지 미추출 |
-| **PDF** | `pdf` | `pdf-extract`+`lopdf` | 본문 텍스트(**한글 CID/ToUnicode 포함**), **폰트크기 기반 헤딩**, **XY-Cut 읽기순서(다단 분리)**, 단락, 제목/작성자/페이지 수 | 표 미복원, 복잡 비정형(매거진) 레이아웃 정확도 보통, 스캔 PDF는 빈 문서(fallback) |
-| **HTML** | `html` `htm` `xhtml` | `scraper` | `<article>/<main>/<body>` 우선, 헤딩/단락/목록(중첩)/표/코드/인용/이미지/링크/강조 | `<script>/<style>/<nav>/<header>/<footer>/<aside>` 제거, JS 렌더링 미지원 |
-| **Markdown** | `md` `markdown` `mdown` `mkd` | `pulldown-cmark` | 헤딩/단락/목록/표/코드/인용/링크/이미지/강조 **재정규화** | 각주/수식/raw HTML 블록 미처리 |
+| 포맷 | 확장자 | 구현 엔진 | 추출 항목 |
+|---|---|---|---|
+| **DOCX** | `docx` | `zip`+`quick-xml` | 헤딩(styles.xml 매핑), 단락, **굵게/기울임/취소선**, 표, 목록, **이미지(base64 data URI)**, 제목/작성자(core.xml) |
+| **PPTX** | `pptx` | `zip`+`quick-xml` | 슬라이드별 제목→h2, 본문 단락, **굵게/기울임**, **표(DrawingML), 이미지**, 슬라이드 경계→PageBreak, 슬라이드 수 |
+| **XLSX** | `xlsx` `xlsm` | `calamine` | 시트별 제목→h2, 사용영역→표, 빈 행/열 trim |
+| **HWPX** | `hwpx` | `zip`+`quick-xml` | 헤딩(header.xml `Outline N`), 단락, 표, **이미지(BinData)**, 제목(content.hpf) |
+| **PDF** | `pdf` | `pdf-extract`+`lopdf` | 본문 텍스트(**한글 CID/ToUnicode 포함**), **폰트크기 기반 헤딩**, **XY-Cut 읽기순서(다단 분리)**, **표 복원(좌표 군집 Stream 방식)**, **내장 이미지(JPEG/JP2)**, 단락, 제목/작성자/페이지 수 |
+| **HTML** | `html` `htm` `xhtml` | `scraper` | `<article>/<main>/<body>` 우선, 헤딩/단락/목록(중첩)/표/코드/인용/이미지/링크/강조 |
+| **Markdown** | `md` `markdown` `mdown` `mkd` | `pulldown-cmark` | 헤딩/단락/목록/표/코드/인용/링크/이미지/강조 **재정규화** |
 
 공통:
 - 입력 선두 **UTF-8 BOM 은 자동 제거**된다.
 - 표 **병합셀(rowspan/colspan)** 은 v0.1 범위에서 미지원(첫 셀 값 보존).
+- **임베디드 이미지**는 `Block::Image` 로 추출되어 Markdown `![alt](data:...)` 로 렌더된다. OOXML(docx/pptx)·HWPX 는 원본 바이트를 base64 로, PDF 는 JPEG/JP2 스트림을 그대로 담는다.
+- **PDF 표 복원**은 글자 좌표 정렬 휴리스틱(Stream 방식)이라 **명확한 격자에 한해** 동작하고, 열 정렬이 어긋나면 표로 보지 않고 본문 단락으로 폴백한다(오탐 억제 우선).
 - 손상 입력에 대해 PDF 파서는 panic 을 격리해 `ParseError` 로 변환한다.
 
 ---
@@ -424,7 +426,29 @@ cat input.pdf | rmt convert --from pdf > output.md
 대부분의 RAG / 벡터 DB 백엔드가 Python 이므로, 이 라이브러리를 ingestion 단에 한 줄로 꽂아
 포맷 다양성 문제를 일괄 해결한다. **abi3(stable ABI)** 로 빌드되어 Python 버전 변화에 forward-compatible 하다.
 
-### 빌드
+### 설치 (Python 사용자)
+
+```bash
+# PyPI 게시 후 — Rust 툴체인 불필요, 휠을 그대로 받는다
+pip install rust_markdown_transformer
+
+# PyPI 게시 전(또는 최신 main 을 쓰고 싶을 때) — GitHub 소스에서 설치
+# 이 경로는 설치 머신에 Rust 툴체인이 필요하다(소스를 직접 컴파일).
+pip install "git+https://github.com/arabangoo/rust_markdown_transformer"
+```
+
+설치하면 어떤 포맷이든 한 줄로 Markdown 으로 정규화할 수 있다.
+
+```python
+import rust_markdown_transformer as rmt
+
+md     = rmt.convert_to_markdown("report.hwpx")           # Markdown 문자열 (청킹·임베딩용)
+ir     = rmt.convert_to_ir_json("report.pdf")             # IR JSON 문자열 (멀티모달/citation 안전망)
+chunks = rmt.convert_to_chunks("report.docx", 512, 64)    # 청크 목록 JSON (벡터 DB 적재용)
+ok     = rmt.is_supported("a.xlsx")                       # 지원 여부 (True/False)
+```
+
+### 빌드 (개발자 · 게시자)
 
 루트의 `pyproject.toml`(maturin 백엔드)이 빌드 메타데이터를 제공한다. abi3 휠이라 Python 3.9+ 단일 휠로 호환된다.
 `[tool.maturin] features = ["python"]` 덕분에 `--features python` 을 생략해도 된다.
@@ -439,7 +463,7 @@ maturin build --release             # target/wheels/rust_markdown_transformer-*.
 pip install target/wheels/rust_markdown_transformer-*.whl
 
 # (c) GitHub 소스에서 바로 설치 (설치 머신에 Rust 툴체인 필요)
-pip install "git+https://github.com/<사용자>/<레포>"
+pip install "git+https://github.com/arabangoo/rust_markdown_transformer"
 ```
 
 ### API
@@ -483,9 +507,9 @@ for path in Path("./corpus").rglob("*"):
 
 | 호스트 | 표면 | 설치 |
 |---|---|---|
-| Python RAG (LangChain/LlamaIndex/자체) | Python 모듈 | `pip install "git+https://github.com/<사용자>/<레포>"` |
+| Python RAG (LangChain/LlamaIndex/자체) | Python 모듈 | `pip install "git+https://github.com/arabangoo/rust_markdown_transformer"` |
 | Rust 서비스 | crate | `Cargo.toml` 에 git 의존성 |
-| 타 언어 / 셸 / 배치 / 오케스트레이션 | CLI(`rmt`) | `cargo install --git <url> rust_markdown_transformer --features cli` |
+| 타 언어 / 셸 / 배치 / 오케스트레이션 | CLI(`rmt`) | `cargo install --git https://github.com/arabangoo/rust_markdown_transformer rust_markdown_transformer --features cli` |
 
 ### 11.1 Python RAG 파이프라인 — 포맷 분기 제거
 
@@ -564,7 +588,7 @@ vector_db.upsert(chunks=split(md), metadata={"ir_ref": store_blob(ir)})
 
 ```toml
 [dependencies]
-rust_markdown_transformer = { git = "https://github.com/<사용자>/<레포>", tag = "v0.1.0" }
+rust_markdown_transformer = { git = "https://github.com/arabangoo/rust_markdown_transformer", tag = "v0.1.0" }
 ```
 
 파싱은 동기·CPU 바운드이므로, async 서버(axum/actix)에서는 `spawn_blocking` 으로 감싼다.
@@ -656,6 +680,20 @@ OOXML 계열(ZIP+XML)이라면 `parsers::ooxml::OoxmlPackage` 헬퍼로 zip 을 
 
 ## 13. 빌드 · Feature 조합 · 테스트
 
+### 레포를 clone 해서 직접 빌드해 쓰기
+
+이 저장소를 clone 한 경우, 쓰려면 **Rust 툴체인(stable, 1.74 이상 권장)** 이 필요하고 한 번 빌드해야 한다. Rust 는 컴파일 언어라 소스만으로는 import/실행되지 않는다. 용도에 따라 셋 중 하나를 고른다.
+
+| 쓰는 방식 | 빌드 명령 | 결과물 |
+|---|---|---|
+| CLI 도구 | `cargo build --release --features cli` | `target/release/rmt` 단일 바이너리 ([9장](#9-cli-도구-rmt)) |
+| Python 모듈 | `pip install maturin && maturin develop --release` | 현재 venv 에 `import rust_markdown_transformer` 설치 ([10장](#10-python-바인딩-pyo3)) |
+| Rust 라이브러리 | `Cargo.toml` 에 `path`/`git` 의존성으로 추가 | 다른 Rust 프로젝트에 링크 ([3장](#3-설치와-cargo-feature)) |
+
+> Python 빌드는 Rust 툴체인 + `maturin` + Python 헤더가 필요하다. 최종 사용자에게 Rust 없이 배포하려면 휠을 빌드해 PyPI 등에 게시하면 된다(빌드 부담은 게시자에게만, 사용자는 `pip install` 만).
+
+### Feature 조합 빌드 · 테스트
+
 ```bash
 # 기본: 전 포맷 + zero FFI (정적 단일 바이너리)
 cargo build --release
@@ -699,7 +737,9 @@ rust_markdown_transformer/
       rmt.rs             # CLI 바이너리 (feature = "cli")
     parsers/
       mod.rs             # feature 게이트 + re-export
-      ooxml.rs           # OOXML/OWPML 공통 zip 언패커
+      ooxml.rs           # OOXML/OWPML 공통 zip 언패커 (관계 .rels · 이미지 해석 포함)
+      media.rs           # 임베디드 이미지 공통 헬퍼 (base64 · MIME 추정)
+      pdf_layout.rs      # PDF 좌표 기반 레이아웃 (헤딩 · 읽기순서 · 표 복원)
       docx.rs  pptx.rs  xlsx.rs  hwpx.rs  pdf.rs  html.rs  markdown.rs
   examples/
     convert.rs           # 단일 파일 변환 예제

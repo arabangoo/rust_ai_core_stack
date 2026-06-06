@@ -472,3 +472,228 @@ fn registry_unsupported_format_errors() {
         rust_markdown_transformer::ConvertError::UnsupportedFormat(_)
     ));
 }
+
+// ── 표/이미지 추출 (신규) ─────────────────────────────────────
+
+#[test]
+fn pptx_table_extraction() {
+    // DrawingML 표(<a:tbl>)가 GFM 표로 추출되는지.
+    let cell =
+        |t: &str| format!("<a:tc><a:txBody><a:p><a:r><a:t>{t}</a:t></a:r></a:p></a:txBody></a:tc>");
+    let slide = format!(
+        r#"<?xml version="1.0"?>
+        <p:sld xmlns:p="p" xmlns:a="a"><p:cSld><p:spTree>
+          <p:graphicFrame><a:graphic><a:graphicData><a:tbl>
+            <a:tr>{}{}</a:tr>
+            <a:tr>{}{}</a:tr>
+          </a:tbl></a:graphicData></a:graphic></p:graphicFrame>
+        </p:spTree></p:cSld></p:sld>"#,
+        cell("H1"),
+        cell("H2"),
+        cell("a"),
+        cell("b"),
+    );
+    let zip = build_zip(&[("ppt/slides/slide1.xml", &slide)]);
+    let md = convert(zip, "pptx", "deck.pptx");
+    assert!(md.contains("| H1 | H2 |"), "pptx table header:\n{md}");
+    assert!(md.contains("| --- | --- |"), "pptx table sep:\n{md}");
+    assert!(md.contains("| a | b |"), "pptx table row:\n{md}");
+}
+
+#[test]
+fn pptx_image_extraction() {
+    // <p:pic>/<a:blip r:embed> → 슬라이드 .rels 로 media 를 찾아 data URI 이미지로.
+    let slide = r#"<?xml version="1.0"?>
+        <p:sld xmlns:p="p" xmlns:a="a" xmlns:r="r"><p:cSld><p:spTree>
+          <p:pic><p:blipFill><a:blip r:embed="rId1"/></p:blipFill></p:pic>
+        </p:spTree></p:cSld></p:sld>"#;
+    let rels = r#"<?xml version="1.0"?>
+        <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+          <Relationship Id="rId1" Type="img" Target="../media/image1.png"/>
+        </Relationships>"#;
+    let zip = build_zip(&[
+        ("ppt/slides/slide1.xml", slide),
+        ("ppt/slides/_rels/slide1.xml.rels", rels),
+        ("ppt/media/image1.png", "PNGDATA"),
+    ]);
+    let md = convert(zip, "pptx", "deck.pptx");
+    // alt = media 파일 stem, data URI = image/png base64.
+    assert!(
+        md.contains("![image1](data:image/png;base64,"),
+        "pptx embedded image:\n{md}"
+    );
+}
+
+#[test]
+fn docx_image_extraction() {
+    // <w:drawing>/<a:blip r:embed> → document.xml.rels 로 media 를 찾아 data URI 이미지로.
+    let document = r#"<?xml version="1.0"?>
+        <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+                    xmlns:a="a" xmlns:r="r">
+          <w:body>
+            <w:p><w:r><w:t>before</w:t></w:r></w:p>
+            <w:p><w:r><w:drawing><a:blip r:embed="rId5"/></w:drawing></w:r></w:p>
+          </w:body>
+        </w:document>"#;
+    let rels = r#"<?xml version="1.0"?>
+        <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+          <Relationship Id="rId5" Type="img" Target="media/photo.jpeg"/>
+        </Relationships>"#;
+    let zip = build_zip(&[
+        ("word/document.xml", document),
+        ("word/_rels/document.xml.rels", rels),
+        ("word/media/photo.jpeg", "JPEGDATA"),
+    ]);
+    let md = convert(zip, "docx", "r.docx");
+    assert!(md.contains("before"), "docx text still parsed:\n{md}");
+    assert!(
+        md.contains("![photo](data:image/jpeg;base64,"),
+        "docx embedded image:\n{md}"
+    );
+}
+
+#[test]
+fn hwpx_image_extraction() {
+    // content.hpf 매니페스트 + 본문 binaryItemIDRef → BinData 이미지를 data URI 로.
+    let header = r#"<?xml version="1.0"?><hh:head xmlns:hh="hh"></hh:head>"#;
+    let content_hpf = r#"<?xml version="1.0"?>
+        <opf:package xmlns:opf="http://www.idpf.org/2007/opf/"><opf:manifest>
+          <opf:item id="image1" href="BinData/image1.png" media-type="image/png" isEmbeded="1"/>
+        </opf:manifest></opf:package>"#;
+    let section = r#"<?xml version="1.0"?>
+        <hs:sec xmlns:hs="hs" xmlns:hp="hp" xmlns:hc="hc">
+          <hp:p><hp:run><hp:pic><hc:img binaryItemIDRef="image1"/></hp:pic></hp:run></hp:p>
+          <hp:p><hp:run><hp:t>hello hwpx</hp:t></hp:run></hp:p>
+        </hs:sec>"#;
+    let zip = build_zip(&[
+        ("Contents/header.xml", header),
+        ("Contents/content.hpf", content_hpf),
+        ("Contents/section0.xml", section),
+        ("BinData/image1.png", "PNGBYTES"),
+    ]);
+    let md = convert(zip, "hwpx", "doc.hwpx");
+    assert!(md.contains("hello hwpx"), "hwpx text still parsed:\n{md}");
+    assert!(
+        md.contains("![image1](data:image/png;base64,"),
+        "hwpx embedded image:\n{md}"
+    );
+}
+
+#[test]
+fn pdf_image_extraction() {
+    // DCTDecode(JPEG) XObject 가 data URI 이미지로 추출되는지.
+    use lopdf::content::{Content, Operation};
+    use lopdf::{dictionary, Document, Object, Stream};
+
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let font_id = doc.add_object(dictionary! {
+        "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Helvetica",
+    });
+    // DCTDecode 이미지 XObject (내용은 추출 검증용 더미 바이트 — base64 대상이면 충분).
+    let image_id = doc.add_object(Stream::new(
+        dictionary! {
+            "Type" => "XObject",
+            "Subtype" => "Image",
+            "Width" => 2,
+            "Height" => 2,
+            "ColorSpace" => "DeviceRGB",
+            "BitsPerComponent" => 8,
+            "Filter" => "DCTDecode",
+        },
+        b"FAKEJPEGDATA".to_vec(),
+    ));
+    let resources_id = doc.add_object(dictionary! {
+        "Font" => dictionary! { "F1" => font_id },
+        "XObject" => dictionary! { "Im1" => image_id },
+    });
+    let content = Content {
+        operations: vec![
+            Operation::new("BT", vec![]),
+            Operation::new("Tf", vec!["F1".into(), 24.into()]),
+            Operation::new("Td", vec![72.into(), 700.into()]),
+            Operation::new("Tj", vec![Object::string_literal("Picture page")]),
+            Operation::new("ET", vec![]),
+        ],
+    };
+    let content_id = doc.add_object(Stream::new(dictionary! {}, content.encode().unwrap()));
+    let page_id = doc.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "Contents" => content_id,
+        "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        "Resources" => resources_id,
+    });
+    let pages = dictionary! { "Type" => "Pages", "Kids" => vec![page_id.into()], "Count" => 1 };
+    doc.objects.insert(pages_id, Object::Dictionary(pages));
+    let catalog_id = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+    doc.trailer.set("Root", catalog_id);
+
+    let mut buf = Vec::new();
+    doc.save_to(&mut buf).unwrap();
+
+    let md = convert(buf, "pdf", "pic.pdf");
+    assert!(
+        md.contains("![image-") && md.contains("data:image/jpeg;base64,"),
+        "pdf embedded image:\n{md}"
+    );
+}
+
+#[test]
+fn pdf_table_reconstruction() {
+    // 괘선 없는 격자(2열 x 3행)를 좌표로 배치 → Stream 방식 표 복원이 GFM 표를 만드는지.
+    use lopdf::content::{Content, Operation};
+    use lopdf::{dictionary, Document, Object, Stream};
+
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let font_id = doc.add_object(dictionary! {
+        "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Helvetica",
+    });
+    let resources_id = doc.add_object(dictionary! { "Font" => dictionary! { "F1" => font_id } });
+
+    // 텍스트를 절대 위치(Tm)로 찍어 2개의 열(x=72, x=320) x 3개의 행(y=700/680/660) 격자 구성.
+    let cell = |x: i64, y: i64, s: &str| -> Vec<Operation> {
+        vec![
+            Operation::new("BT", vec![]),
+            Operation::new("Tf", vec!["F1".into(), 12.into()]),
+            Operation::new(
+                "Tm",
+                vec![1.into(), 0.into(), 0.into(), 1.into(), x.into(), y.into()],
+            ),
+            Operation::new("Tj", vec![Object::string_literal(s)]),
+            Operation::new("ET", vec![]),
+        ]
+    };
+    let mut ops = Vec::new();
+    for (x, s) in [(72_i64, "Name"), (320, "Age")] {
+        ops.extend(cell(x, 700, s));
+    }
+    for (x, s) in [(72_i64, "Alice"), (320, "30")] {
+        ops.extend(cell(x, 680, s));
+    }
+    for (x, s) in [(72_i64, "Bob"), (320, "25")] {
+        ops.extend(cell(x, 660, s));
+    }
+    let content = Content { operations: ops };
+    let content_id = doc.add_object(Stream::new(dictionary! {}, content.encode().unwrap()));
+    let page_id = doc.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "Contents" => content_id,
+        "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        "Resources" => resources_id,
+    });
+    let pages = dictionary! { "Type" => "Pages", "Kids" => vec![page_id.into()], "Count" => 1 };
+    doc.objects.insert(pages_id, Object::Dictionary(pages));
+    let catalog_id = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+    doc.trailer.set("Root", catalog_id);
+
+    let mut buf = Vec::new();
+    doc.save_to(&mut buf).unwrap();
+
+    let md = convert(buf, "pdf", "table.pdf");
+    assert!(md.contains("| Name | Age |"), "pdf table header:\n{md}");
+    assert!(md.contains("| Alice | 30 |"), "pdf table row 1:\n{md}");
+    assert!(md.contains("| Bob | 25 |"), "pdf table row 2:\n{md}");
+}

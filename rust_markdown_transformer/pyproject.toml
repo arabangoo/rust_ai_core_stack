@@ -21,7 +21,7 @@ classifiers = [
 dynamic = ["version"]
 
 [project.urls]
-Repository = "https://github.com/"
+Repository = "https://github.com/arabangoo/rust_markdown_transformer"
 
 [tool.maturin]
 # Rust 의 #[pymodule] 함수명 = cdylib 이름과 일치해야 한다.

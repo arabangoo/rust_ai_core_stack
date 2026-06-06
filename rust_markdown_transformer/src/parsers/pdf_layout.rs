@@ -17,9 +17,10 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use pdf_extract::{output_doc, MediaBox, OutputDev, OutputError, Transform};
 
-use crate::ir::{Block, Inline};
+use crate::ir::{Block, Inline, Table};
 
 /// 수집된 글자 1개 (페이지 상단 기준 top-down 좌표).
+#[derive(Clone)]
 struct CharBox {
     x: f64,    // 좌측 시작 x
     y: f64,    // 상단 기준 y (아래로 증가)
@@ -101,8 +102,9 @@ pub fn layout_blocks(doc: &lopdf::Document) -> Vec<Block> {
         _ => return Vec::new(),
     }
 
-    let pages: Vec<Vec<Line>> = col.pages.into_iter().map(group_lines).collect();
-    let all_sizes: Vec<f64> = pages.iter().flatten().map(|l| round_half(l.size)).collect();
+    let char_pages = col.pages; // Vec<Vec<CharBox>> (표 복원에 단어 좌표가 필요해 보존)
+    let line_pages: Vec<Vec<Line>> = char_pages.iter().map(|c| group_lines(c.clone())).collect();
+    let all_sizes: Vec<f64> = line_pages.iter().flatten().map(|l| round_half(l.size)).collect();
     if all_sizes.is_empty() {
         return Vec::new(); // 텍스트 0 → 스캔 PDF 로 보고 fallback
     }
@@ -110,15 +112,21 @@ pub fn layout_blocks(doc: &lopdf::Document) -> Vec<Block> {
     let tiers = heading_tiers(&all_sizes, body);
 
     let mut out: Vec<Block> = Vec::new();
-    for lines in &pages {
+    for (chars, lines) in char_pages.iter().zip(line_pages.iter()) {
         if lines.is_empty() {
             continue;
         }
         if !out.is_empty() {
             out.push(Block::PageBreak);
         }
-        let order = xy_cut_order(lines);
-        assemble(lines, &order, body, &tiers, &mut out);
+        // 표가 검출되면 단락+표를 위→아래로 조립, 아니면 기존 XY-Cut 경로로 폴백
+        // (표가 없는 페이지는 기존과 100% 동일한 출력).
+        if let Some(mut blocks) = table_aware_page(chars, body, &tiers) {
+            out.append(&mut blocks);
+        } else {
+            let order = xy_cut_order(lines);
+            assemble(lines, &order, body, &tiers, &mut out);
+        }
     }
     out
 }
@@ -345,6 +353,299 @@ fn assemble(lines: &[Line], order: &[usize], body: f64, tiers: &[f64], out: &mut
         last = Some(i);
     }
     flush(&mut para, out);
+}
+
+// ── 5. 표 복원 (Stream 방식: 글자 좌표 군집) ──────────────────
+//
+// 괘선이 없는 표를 행=y 군집·열=x 정렬로 복원한다 (Camelot "stream"/pdfplumber 계열의
+// 공개 휴리스틱 기반 clean-room). **명확한 격자만** 표로 인정하고, 한 셀이라도 열에 깔끔히
+// 정렬되지 않으면 표로 보지 않는다(정밀도 우선 — 오탐을 줄이고 본문 단락으로 폴백).
+// 병합셀·여러 줄 셀은 미지원(README §12). 다단 본문 레이아웃은 표 미검출 시 기존 XY-Cut 으로 처리.
+
+/// 한 행의 셀(큰 가로 공백으로 분리된 텍스트 덩어리). `x0` 는 열 정렬 기준.
+struct Cell {
+    x0: f64,
+    text: String,
+}
+
+/// 셀을 보존한 행. `cells.len() >= 2` 면 표 후보 행.
+struct Row {
+    y0: f64,
+    y1: f64,
+    size: f64,
+    cells: Vec<Cell>,
+}
+
+impl Row {
+    fn text(&self) -> String {
+        collapse_ws(&self.cells.iter().map(|c| c.text.as_str()).collect::<Vec<_>>().join(" "))
+    }
+}
+
+/// 페이지 글자 → 행(셀 보존) 목록. y 군집 기준은 [`group_lines`] 와 동일.
+fn group_rows(chars: &[CharBox]) -> Vec<Row> {
+    if chars.is_empty() {
+        return Vec::new();
+    }
+    let mut chars: Vec<CharBox> = chars.to_vec();
+    chars.sort_by(|a, b| total(a.y, b.y).then(total(a.x, b.x)));
+
+    let mut rows: Vec<Row> = Vec::new();
+    let mut bucket: Vec<CharBox> = Vec::new();
+    let mut y_ref = chars[0].y;
+    let mut size_ref = chars[0].size;
+
+    for c in chars {
+        let tol = 0.6 * size_ref.max(c.size);
+        if (c.y - y_ref).abs() <= tol {
+            y_ref = (y_ref * bucket.len() as f64 + c.y) / (bucket.len() as f64 + 1.0);
+            size_ref = size_ref.max(c.size);
+            bucket.push(c);
+        } else {
+            if let Some(r) = build_row(std::mem::take(&mut bucket)) {
+                rows.push(r);
+            }
+            y_ref = c.y;
+            size_ref = c.size;
+            bucket.push(c);
+        }
+    }
+    if let Some(r) = build_row(bucket) {
+        rows.push(r);
+    }
+    rows
+}
+
+/// 한 줄의 글자들 → 셀 분할. 가로 공백이 `1.2*size` 보다 크면 셀(열) 경계.
+fn build_row(mut chars: Vec<CharBox>) -> Option<Row> {
+    if chars.is_empty() {
+        return None;
+    }
+    chars.sort_by(|a, b| total(a.x, b.x));
+    let sizes: Vec<f64> = chars.iter().map(|c| c.size).collect();
+    let size = median(&sizes);
+    let cell_gap = 1.2 * size; // 이보다 큰 가로 공백 = 셀(열) 경계
+    let word_gap = 0.1 * size; // 단어 사이 공백
+
+    let mut cells: Vec<Cell> = Vec::new();
+    let mut cur = String::new();
+    let mut cx0 = f64::NAN;
+    let mut prev_end: Option<f64> = None;
+    let (mut y0, mut y1) = (f64::MAX, f64::MIN);
+
+    for c in &chars {
+        if let Some(pe) = prev_end {
+            let gap = c.x - pe;
+            if gap > cell_gap {
+                push_cell(&mut cells, &mut cur, &mut cx0);
+            } else if gap > word_gap && !cur.ends_with(' ') {
+                cur.push(' ');
+            }
+        }
+        if cx0.is_nan() {
+            cx0 = c.x;
+        }
+        cur.push_str(&c.ch);
+        prev_end = Some(c.x + c.adv);
+        y0 = y0.min(c.y);
+        y1 = y1.max(c.y + c.size);
+    }
+    push_cell(&mut cells, &mut cur, &mut cx0);
+    if cells.is_empty() {
+        return None;
+    }
+    Some(Row { y0, y1, size, cells })
+}
+
+fn push_cell(cells: &mut Vec<Cell>, cur: &mut String, cx0: &mut f64) {
+    let text = collapse_ws(cur);
+    if !text.is_empty() {
+        cells.push(Cell { x0: *cx0, text });
+    }
+    cur.clear();
+    *cx0 = f64::NAN;
+}
+
+/// 인접한 표 후보 행(셀>=2)들을 묶어 `(start, end, 열 중심들)` 영역으로.
+fn find_table_regions(rows: &[Row]) -> Vec<(usize, usize, Vec<f64>)> {
+    let mut regions = Vec::new();
+    let mut i = 0;
+    while i < rows.len() {
+        if rows[i].cells.len() >= 2 {
+            let start = i;
+            let mut j = i + 1;
+            while j < rows.len()
+                && rows[j].cells.len() >= 2
+                && (rows[j].y0 - rows[j - 1].y1) < 1.5 * rows[j].size
+            {
+                j += 1;
+            }
+            if j - start >= 2 {
+                if let Some(cols) = infer_columns(&rows[start..j]) {
+                    regions.push((start, j, cols));
+                    i = j;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    regions
+}
+
+/// 영역 행들의 셀 x0 를 열로 군집. 모든 셀이 한 열에 tol 내로 깔끔히 매핑되고
+/// (열 중복 없음) 열이 2개 이상이면 `Some(열 중심들)`. 어긋나면 None(표 아님).
+fn infer_columns(rows: &[Row]) -> Option<Vec<f64>> {
+    let sizes: Vec<f64> = rows.iter().map(|r| r.size).collect();
+    let tol = 1.5 * median(&sizes);
+
+    let mut xs: Vec<f64> = rows.iter().flat_map(|r| r.cells.iter().map(|c| c.x0)).collect();
+    if xs.is_empty() {
+        return None;
+    }
+    xs.sort_by(|a, b| total(*a, *b));
+
+    // 1D 그리디 군집: 인접 x0 차이가 tol 이하면 같은 열.
+    let mut cols: Vec<f64> = Vec::new();
+    let mut group: Vec<f64> = vec![xs[0]];
+    for &x in &xs[1..] {
+        if x - group[group.len() - 1] <= tol {
+            group.push(x);
+        } else {
+            cols.push(mean(&group));
+            group = vec![x];
+        }
+    }
+    cols.push(mean(&group));
+
+    if cols.len() < 2 {
+        return None;
+    }
+
+    // 검증: 각 행의 모든 셀이 정확히 한 열에 tol 내로 매핑되고 한 행에 같은 열 중복 없음.
+    for r in rows {
+        let mut used = vec![false; cols.len()];
+        for c in &r.cells {
+            let k = nearest_col(&cols, c.x0)?;
+            if (cols[k] - c.x0).abs() > tol || used[k] {
+                return None;
+            }
+            used[k] = true;
+        }
+    }
+    Some(cols)
+}
+
+/// 영역 행들 + 열 중심 → [`Table`]. 헤더는 첫 행, 나머지는 데이터 행.
+fn build_table(rows: &[Row], cols: &[f64]) -> Option<Table> {
+    let sizes: Vec<f64> = rows.iter().map(|r| r.size).collect();
+    let tol = 1.5 * median(&sizes);
+
+    let mut grid: Vec<Vec<String>> = Vec::new();
+    for r in rows {
+        let mut cells = vec![String::new(); cols.len()];
+        for c in &r.cells {
+            let k = nearest_col(cols, c.x0)?;
+            if (cols[k] - c.x0).abs() > tol {
+                return None;
+            }
+            if cells[k].is_empty() {
+                cells[k] = c.text.clone();
+            } else {
+                cells[k].push(' ');
+                cells[k].push_str(&c.text);
+            }
+        }
+        grid.push(cells);
+    }
+    if grid.len() < 2 || cols.len() < 2 {
+        return None;
+    }
+    let headers = grid.remove(0);
+    Some(Table { headers, rows: grid, caption: None })
+}
+
+/// 페이지를 행(셀 보존)으로 재구성해 표 영역을 찾는다. 표가 하나라도 있으면 단락+표를
+/// 위→아래 순서로 조립해 `Some` 반환. 표가 없으면 `None`(호출부에서 기존 경로로 폴백).
+fn table_aware_page(chars: &[CharBox], body: f64, tiers: &[f64]) -> Option<Vec<Block>> {
+    let rows = group_rows(chars);
+    if rows.len() < 2 {
+        return None;
+    }
+    let regions = find_table_regions(&rows);
+    if regions.is_empty() {
+        return None;
+    }
+
+    let mut out: Vec<Block> = Vec::new();
+    let mut para: Vec<String> = Vec::new();
+    let flush = |para: &mut Vec<String>, out: &mut Vec<Block>| {
+        if !para.is_empty() {
+            let t = collapse_ws(&para.join(" "));
+            if !t.is_empty() {
+                out.push(Block::Paragraph(vec![Inline::Text(t)]));
+            }
+            para.clear();
+        }
+    };
+
+    let mut i = 0;
+    let mut ri = 0;
+    while i < rows.len() {
+        if ri < regions.len() && regions[ri].0 == i {
+            let (start, end, cols) = &regions[ri];
+            flush(&mut para, &mut out);
+            if let Some(tbl) = build_table(&rows[*start..*end], cols) {
+                out.push(Block::Table(tbl));
+            }
+            i = *end;
+            ri += 1;
+            continue;
+        }
+        let row = &rows[i];
+        let text = row.text();
+        if !text.is_empty() {
+            if let Some(level) = heading_level(row.size, body, tiers) {
+                flush(&mut para, &mut out);
+                out.push(Block::Heading { level, text });
+            } else {
+                para.push(text);
+            }
+        }
+        i += 1;
+    }
+    flush(&mut para, &mut out);
+
+    if out.iter().any(|b| matches!(b, Block::Table(_))) {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+fn nearest_col(cols: &[f64], x: f64) -> Option<usize> {
+    let mut best = 0;
+    let mut bd = f64::MAX;
+    for (k, &c) in cols.iter().enumerate() {
+        let d = (c - x).abs();
+        if d < bd {
+            bd = d;
+            best = k;
+        }
+    }
+    if bd.is_finite() {
+        Some(best)
+    } else {
+        None
+    }
+}
+
+fn mean(v: &[f64]) -> f64 {
+    if v.is_empty() {
+        0.0
+    } else {
+        v.iter().sum::<f64>() / v.len() as f64
+    }
 }
 
 // ── 유틸 ─────────────────────────────────────────────────────

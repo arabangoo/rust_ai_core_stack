@@ -53,12 +53,15 @@ impl FormatParser for HwpxParser {
         let mut metadata = DocumentMetadata::new(SourceFormat::Hwpx, filename);
         metadata.title = parse_title(&pkg);
 
+        // content.hpf 매니페스트 → binaryItemID → 이미지.
+        let images = build_images(&pkg)?;
+
         let mut blocks: Vec<Block> = Vec::new();
         for section in &sections {
             let xml = pkg
                 .get_str(section, FMT)?
                 .ok_or_else(|| ParseError::container(FMT, format!("missing {section}")))?;
-            parse_section(&xml, &styles, &mut blocks)?;
+            parse_section(&xml, &styles, &images, &mut blocks)?;
         }
 
         Ok(Document { metadata, blocks })
@@ -111,6 +114,51 @@ fn parse_title(pkg: &OoxmlPackage) -> Option<String> {
     None
 }
 
+/// content.hpf 매니페스트(`<opf:item id href media-type>`)로 BinData 이미지를 적재.
+/// → binaryItemID → (alt stem, base64 [`ImageData`]). 이미지(media-type `image/*`)만.
+fn build_images(pkg: &OoxmlPackage) -> Result<HashMap<String, (String, ImageData)>, ParseError> {
+    let mut out = HashMap::new();
+    let xml = match pkg.get_str("Contents/content.hpf", FMT)? {
+        Some(x) => x,
+        None => return Ok(out),
+    };
+    let mut reader = Reader::from_str(&xml);
+    loop {
+        match reader.read_event() {
+            Ok(Event::Eof) => break,
+            Ok(Event::Start(e)) | Ok(Event::Empty(e))
+                if local_name(e.name().as_ref()) == b"item" =>
+            {
+                let id = attr_val(&e, b"id");
+                let href = attr_val(&e, b"href");
+                let media = attr_val(&e, b"media-type").unwrap_or_default();
+                if let (Some(id), Some(href)) = (id, href) {
+                    let path_mime = super::media::mime_from_path(&href);
+                    if !media.starts_with("image/") && !path_mime.starts_with("image/") {
+                        continue;
+                    }
+                    // href 가 패키지 루트/Contents 중 어느 기준이든 폴백 해석.
+                    if let Some(bytes) = pkg.get(&href).or_else(|| pkg.get_by_suffix(&href)) {
+                        let mime = if media.starts_with("image/") {
+                            media.clone()
+                        } else {
+                            path_mime.to_string()
+                        };
+                        let data = ImageData::Base64 {
+                            mime,
+                            data: super::media::base64_encode(bytes),
+                        };
+                        out.insert(id, (super::media::stem_of(&href), data));
+                    }
+                }
+            }
+            Ok(_) => {}
+            Err(e) => return Err(ParseError::markup(FMT, format!("content.hpf: {e}"))),
+        }
+    }
+    Ok(out)
+}
+
 struct TableCtx {
     rows: Vec<Vec<String>>,
     cur_row: Vec<String>,
@@ -128,9 +176,12 @@ impl TableCtx {
     }
 }
 
+type ImageMap = HashMap<String, (String, ImageData)>;
+
 fn parse_section(
     xml: &str,
     styles: &HashMap<String, u8>,
+    images: &ImageMap,
     blocks: &mut Vec<Block>,
 ) -> Result<(), ParseError> {
     let mut reader = Reader::from_str(xml);
@@ -146,20 +197,31 @@ fn parse_section(
             .map_err(|e| ParseError::markup(FMT, format!("section: {e}")))?;
         match ev {
             Event::Eof => break,
-            Event::Start(e) | Event::Empty(e) => match local_name(e.name().as_ref()) {
-                b"p" => {
-                    para_text.clear();
-                    para_style = attr_val(&e, b"styleIDRef");
-                }
-                b"t" => in_text = true,
-                b"tbl" => tables.push(TableCtx::new()),
-                b"tc" => {
-                    if let Some(t) = tables.last_mut() {
-                        t.cell_buf.clear();
+            Event::Start(e) | Event::Empty(e) => {
+                // 그림: BinData 를 참조하는 binaryItemIDRef 속성을 가진 엘리먼트
+                // (`<hp:pic>/<hc:img binaryItemIDRef>`). 표 밖에서만 블록으로.
+                if tables.is_empty() {
+                    if let Some(rid) = attr_val_local(&e, b"binaryItemIDRef") {
+                        if let Some((alt, data)) = images.get(&rid) {
+                            blocks.push(Block::Image { alt: alt.clone(), data: data.clone() });
+                        }
                     }
                 }
-                _ => {}
-            },
+                match local_name(e.name().as_ref()) {
+                    b"p" => {
+                        para_text.clear();
+                        para_style = attr_val(&e, b"styleIDRef");
+                    }
+                    b"t" => in_text = true,
+                    b"tbl" => tables.push(TableCtx::new()),
+                    b"tc" => {
+                        if let Some(t) = tables.last_mut() {
+                            t.cell_buf.clear();
+                        }
+                    }
+                    _ => {}
+                }
+            }
             Event::Text(t) => {
                 if in_text {
                     let s = t
@@ -245,6 +307,17 @@ fn local_name(name: &[u8]) -> &[u8] {
 fn attr_val(e: &quick_xml::events::BytesStart, key: &[u8]) -> Option<String> {
     e.attributes().flatten().find_map(|a| {
         if a.key.as_ref() == key {
+            a.unescape_value().ok().map(|v| v.to_string())
+        } else {
+            None
+        }
+    })
+}
+
+/// 속성 키를 **local name**(`:` 뒤)으로 비교 (네임스페이스 prefix 변동 대비).
+fn attr_val_local(e: &quick_xml::events::BytesStart, local: &[u8]) -> Option<String> {
+    e.attributes().flatten().find_map(|a| {
+        if local_name(a.key.as_ref()) == local {
             a.unescape_value().ok().map(|v| v.to_string())
         } else {
             None

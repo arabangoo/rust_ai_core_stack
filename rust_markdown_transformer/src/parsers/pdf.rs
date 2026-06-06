@@ -42,12 +42,15 @@ impl FormatParser for PdfParser {
 
         let mut metadata = DocumentMetadata::new(SourceFormat::Pdf, filename);
 
+        // doc 를 한 번 로드해 메타데이터·layout·이미지 추출에 재사용.
+        let doc = lopdf::Document::load_mem(&buf).ok();
+
         // 1차: layout 레이어 (좌표·폰트크기 기반 헤딩 + XY-Cut 읽기순서).
-        //      doc 를 한 번 로드해 메타데이터와 layout 모두에 재사용.
-        if let Ok(doc) = lopdf::Document::load_mem(&buf) {
-            fill_metadata(&doc, &mut metadata);
-            let blocks = super::pdf_layout::layout_blocks(&doc);
+        if let Some(doc) = &doc {
+            fill_metadata(doc, &mut metadata);
+            let mut blocks = super::pdf_layout::layout_blocks(doc);
             if !blocks.is_empty() {
+                blocks.extend(extract_images(doc));
                 return Ok(Document { metadata, blocks });
             }
         }
@@ -58,7 +61,10 @@ impl FormatParser for PdfParser {
             .map_err(|_| ParseError::container(FMT, "pdf-extract panicked on malformed PDF"))?
             .map_err(|e| ParseError::container(FMT, format!("text extraction failed: {e}")))?;
 
-        let blocks = text_to_blocks(&text);
+        let mut blocks = text_to_blocks(&text);
+        if let Some(doc) = &doc {
+            blocks.extend(extract_images(doc));
+        }
         Ok(Document { metadata, blocks })
     }
 }
@@ -68,6 +74,50 @@ fn fill_metadata(doc: &lopdf::Document, meta: &mut DocumentMetadata) {
     meta.page_count = Some(doc.get_pages().len());
     meta.title = info_field(doc, b"Title");
     meta.author = info_field(doc, b"Author");
+}
+
+/// 페이지 순서대로 내장 이미지를 추출해 `Block::Image` 목록으로 반환.
+/// 본문 텍스트 뒤에 모아 붙인다(정확한 본문 내 위치 매핑은 콘텐츠 스트림 분석 필요 — 후속 과제).
+/// lopdf 호출이 손상 PDF 에서 panic 할 가능성을 격리한다 (README §1-1).
+fn extract_images(doc: &lopdf::Document) -> Vec<Block> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| collect_images(doc)))
+        .unwrap_or_default()
+}
+
+fn collect_images(doc: &lopdf::Document) -> Vec<Block> {
+    let mut out = Vec::new();
+    for (_num, page_id) in doc.get_pages() {
+        let images = match doc.get_page_images(page_id) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        for img in images {
+            if let Some(mime) = supported_image_mime(&img) {
+                out.push(Block::Image {
+                    alt: format!("image-{}-{}", img.id.0, img.id.1),
+                    data: ImageData::Base64 {
+                        mime: mime.to_string(),
+                        data: super::media::base64_encode(img.content),
+                    },
+                });
+            }
+        }
+    }
+    out
+}
+
+/// 스트림 바이트가 **그대로 완전한 이미지 파일**인 필터만 MIME 으로 매핑.
+/// DCTDecode = JPEG, JPXDecode = JPEG2000. FlateDecode/무압축 raster(샘플 재구성 필요)는
+/// width/height/colorspace 로 PNG 를 합성하는 후속 과제로 남긴다.
+fn supported_image_mime(img: &lopdf::xobject::PdfImage<'_>) -> Option<&'static str> {
+    let filters = img.filters.as_ref()?;
+    if filters.iter().any(|f| f == "DCTDecode") {
+        Some("image/jpeg")
+    } else if filters.iter().any(|f| f == "JPXDecode") {
+        Some("image/jp2")
+    } else {
+        None
+    }
 }
 
 fn info_field(doc: &lopdf::Document, key: &[u8]) -> Option<String> {

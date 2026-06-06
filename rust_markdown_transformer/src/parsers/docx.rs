@@ -47,7 +47,9 @@ impl FormatParser for DocxParser {
         let mut metadata = DocumentMetadata::new(SourceFormat::Docx, filename);
         parse_core_props(&pkg, &mut metadata)?;
 
-        let blocks = parse_body(&doc_xml, &styles)?;
+        // 본문 그림 관계 (`word/_rels/document.xml.rels`) → rId → 이미지.
+        let images = pkg.image_rels("word/document.xml", FMT)?;
+        let blocks = parse_body(&doc_xml, &styles, &images)?;
         Ok(Document { metadata, blocks })
     }
 }
@@ -153,11 +155,16 @@ impl TableCtx {
 }
 
 /// document.xml 본문 → 블록 목록.
-fn parse_body(xml: &str, styles: &HashMap<String, u8>) -> Result<Vec<Block>, ParseError> {
+fn parse_body(
+    xml: &str,
+    styles: &HashMap<String, u8>,
+    images: &HashMap<String, (String, ImageData)>,
+) -> Result<Vec<Block>, ParseError> {
     let mut reader = Reader::from_str(xml);
 
     let mut blocks: Vec<Block> = Vec::new();
     let mut pending_list: Vec<ListItem> = Vec::new();
+    let mut in_drawing = false; // <w:drawing> 안인지 (그림 blip 판별용)
 
     // 현재 단락 상태.
     let mut runs: Vec<Inline> = Vec::new();
@@ -209,6 +216,11 @@ fn parse_body(xml: &str, styles: &HashMap<String, u8>) -> Result<Vec<Block>, Par
                 }
                 b"w:numPr" => is_list_item = true,
                 b"w:tbl" => tables.push(TableCtx::new()),
+                b"w:drawing" | b"w:pict" => in_drawing = true,
+                // 그림이 자식을 갖는 경우 blip 이 Start 로 올 수 있다.
+                b"a:blip" => {
+                    emit_image(&mut blocks, &mut pending_list, &e, in_drawing, &tables, images)
+                }
                 b"w:tc" => {
                     if let Some(t) = tables.last_mut() {
                         t.cell_buf.clear();
@@ -232,6 +244,9 @@ fn parse_body(xml: &str, styles: &HashMap<String, u8>) -> Result<Vec<Block>, Par
                 b"w:strike" if in_rpr => strike = !is_off(&e),
                 b"w:br" => push_text(&mut tables, &mut runs, None, false, false, false, true),
                 b"w:tab" => push_text(&mut tables, &mut runs, Some("\t"), false, false, false, false),
+                b"a:blip" => {
+                    emit_image(&mut blocks, &mut pending_list, &e, in_drawing, &tables, images)
+                }
                 _ => {}
             },
 
@@ -247,6 +262,7 @@ fn parse_body(xml: &str, styles: &HashMap<String, u8>) -> Result<Vec<Block>, Par
 
             Event::End(e) => match e.name().as_ref() {
                 b"w:rPr" => in_rpr = false,
+                b"w:drawing" | b"w:pict" => in_drawing = false,
                 b"w:t" => in_text = false,
                 b"w:tc" => {
                     if let Some(t) = tables.last_mut() {
@@ -380,6 +396,27 @@ fn emit_paragraph(
 fn flush_pending(blocks: &mut Vec<Block>, pending_list: &mut Vec<ListItem>) {
     if !pending_list.is_empty() {
         blocks.push(Block::List { ordered: false, items: std::mem::take(pending_list) });
+    }
+}
+
+/// `<a:blip r:embed>` → 그림(`w:drawing`) 안이고 표 밖이면 `Block::Image` 추가.
+/// 표 셀 안 이미지는 v0.1 에서 생략(셀은 평문만).
+fn emit_image(
+    blocks: &mut Vec<Block>,
+    pending_list: &mut Vec<ListItem>,
+    e: &quick_xml::events::BytesStart,
+    in_drawing: bool,
+    tables: &[TableCtx],
+    images: &HashMap<String, (String, ImageData)>,
+) {
+    if !in_drawing || !tables.is_empty() {
+        return;
+    }
+    if let Some(rid) = attr_val(e, b"r:embed") {
+        if let Some((alt, data)) = images.get(&rid) {
+            flush_pending(blocks, pending_list);
+            blocks.push(Block::Image { alt: alt.clone(), data: data.clone() });
+        }
     }
 }
 

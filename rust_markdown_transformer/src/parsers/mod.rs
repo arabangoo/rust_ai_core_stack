@@ -4,6 +4,10 @@
 #[cfg(any(feature = "docx", feature = "pptx", feature = "hwpx"))]
 pub(crate) mod ooxml;
 
+// 임베디드 이미지(base64/MIME) 공통 헬퍼 — docx/pptx/hwpx/pdf 가 공유.
+#[cfg(any(feature = "docx", feature = "pptx", feature = "hwpx", feature = "pdf"))]
+pub(crate) mod media;
+
 #[cfg(feature = "docx")]
 mod docx;
 #[cfg(feature = "docx")]
