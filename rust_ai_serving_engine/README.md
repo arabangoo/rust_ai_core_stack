@@ -13,7 +13,7 @@
 
 1. Attention Is All You Need (Transformer 구조의 원전) - https://arxiv.org/abs/1706.03762
 2. LLaMA: Open and Efficient Foundation Language Models (Llama 계열 디코더 구조) - https://arxiv.org/abs/2302.13971
-3. Qwen3 Technical Report (실모델 종단 간 검증에 사용한 Qwen3 계열) - https://arxiv.org/abs/2505.09388
+3. Efficiently Scaling Transformer Inference (추론을 프리필·디코드 국면으로 분해하고 연산량·메모리 대역폭 상한으로 성능을 분석하는 모델의 원전. RASE_PROFILE 구간 프로파일링의 이론 근거) - https://arxiv.org/abs/2211.05102
 4. The Case for 4-bit Precision: k-bit Inference Scaling Laws (4비트 양자화 추론의 근거) - https://arxiv.org/abs/2212.09720
 5. Efficient Memory Management for Large Language Model Serving with PagedAttention (LLM 서빙과 KV 캐시 관리) - https://arxiv.org/abs/2309.06180
 
@@ -50,7 +50,7 @@
 | 원칙 | 의미 |
 |---|---|
 | **커널은 만들지 않고 조립한다** | 텐서 연산·모델 구현은 Hugging Face 의 Rust 프레임워크 Candle 을 쓴다. 엔진의 차별점은 모델 수명주기(등록·검증·로드·캐시·언로드)와 서빙 계약이다. 단 CPU 프리필은 예외적으로 자체 하이브리드 커널 경로를 갖는다(아래). |
-| **하이브리드 프리필** | Candle 의 양자화 행렬곱은 프롬프트 토큰마다 가중치 전체를 다시 역양자화해 프리필이 디코드만큼 느리다. 엔진은 긴 프롬프트에서 레이어별 가중치를 1회만 역양자화해 f32 행렬곱(GEMM)으로 처리하고, 디코드는 메모리 최적인 양자화 커널을 유지한다. 긴 프롬프트의 어텐션도 자체 블록형 커널(질의 16행이 K/V 읽기를 공유, online softmax 정확 계산)로 처리한다 — 16코어 AVX2 노트북 실측 기준 1,500자 문서 컨텍스트의 첫 토큰이 141초에서 20초로, 4,000자는 97초에서 48초로 단축. |
+| **하이브리드 프리필 + GQA 디코드** | Candle 의 양자화 행렬곱은 프롬프트 토큰마다 가중치 전체를 다시 역양자화해 프리필이 디코드만큼 느리다. 엔진은 긴 프롬프트에서 레이어별 가중치를 1회만 역양자화해 f32 행렬곱(GEMM)으로 처리하고, 디코드는 메모리 최적인 양자화 커널을 유지한다. 긴 프롬프트의 어텐션도 자체 블록형 커널(질의 16행이 K/V 읽기를 공유, online softmax 정확 계산)로 처리하며 — 16코어 AVX2 노트북 실측 기준 1,500자 문서 컨텍스트의 첫 토큰이 141초에서 20초로, 4,000자는 97초에서 48초로 단축 — 디코드 어텐션도 KV 공유비가 큰 GQA 모델(쿼리:KV 가 2:1 초과, 예: Qwen3-4B 의 32:8)에서 KV 를 1회만 읽고 그룹의 쿼리 헤드 전체를 갱신하는 자체 커널로 중복 읽기를 제거한다. |
 | **매니페스트가 곧 계약** | 모델 파일은 SHA-256 해시·아키텍처·토크나이저·채팅 템플릿이 기록된 TOML 매니페스트로만 실행된다. "실행 가능한 모델"과 "그냥 큰 파일"을 구분한다. |
 | **결정적 생성** | 같은 모델·프롬프트·시드·샘플링 설정이면 같은 출력. 고정 시드 샘플러와 결정적 생성 루프로 회귀 시험이 가능하다. |
 | **한 번 로드, 계속 재사용** | 프로세스 전역 세션 캐시가 해시 검증·모델 로드를 최초 1회만 수행한다. 요청마다 수 GB 를 다시 읽지 않는다. |
@@ -348,7 +348,7 @@ pub enum EngineError {
 
 | 아키텍처 (`--architecture`) | 디코더 | 대표 모델 |
 |---|---|---|
-| `qwen3` | `Qwen3GgufDecoder` (Candle quantized_qwen3) | Qwen3-4B-Instruct-2507 — 실모델로 채팅 완성·SSE 스트리밍·한국어 다중 바이트·세션 캐시 재사용까지 종단 간 검증 (16코어 CPU 노트북 기준 약 초당 5토큰) |
+| `qwen3` | `Qwen3GgufDecoder` (Candle quantized_qwen3) | Qwen3-1.7B · Qwen3-4B-Instruct-2507 — 실모델로 채팅 완성·SSE 스트리밍·한국어 다중 바이트·세션 캐시 재사용까지 종단 간 검증. 디코드 실측(16코어 하이브리드 CPU 노트북, 짧은 컨텍스트 기준): 1.7B q4 약 초당 40-46토큰, 4B q4 약 초당 20토큰 (8장 디코드 스레드 정책 적용 시) |
 | `llama` `llama2` `llama3` `mistral` `mixtral` | `LlamaGgufDecoder` (Candle quantized_llama) | Llama 2·3, Mistral, Mixtral instruct 계열 |
 
 동작 메모:
@@ -356,9 +356,13 @@ pub enum EngineError {
 - **지원 밖 아키텍처는 잘못된 출력 대신 명확한 에러로 거절한다.** `qwen2` 는 Qwen3 GGUF 사용을 안내하는
   에러를, `phi` 는 지원 제외 사유를 담은 에러를 반환한다. Safetensors 는 레지스트리 등록·해시 검증 대상이고
   실행은 GGUF 로 한다.
-- **Qwen3 는 non-thinking instruct 변형을 쓴다.** Qwen3 기본판은 답변 전 `<think>` 추론 블록을 길게
-  생성하는 하이브리드 모델이라 CPU 에서 체감이 크게 나빠진다. Qwen3-4B-Instruct-2507 처럼
-  thinking 이 제거된 instruct 변형은 ChatML 템플릿 그대로 동작한다 (검증 완료).
+- **Qwen3 하이브리드(thinking) 모델은 `/no_think` 로 다룬다.** Qwen3 기본판(0.6B·1.7B 등)은 답변 전
+  `<think>` 추론 블록을 생성하는 하이브리드 모델이다. CPU 서빙에서는 시스템 프롬프트에 Qwen 공식
+  소프트 스위치 `/no_think` 를 붙여 추론을 끄는 것이 정석이며, 이 방식으로 Qwen3-1.7B 실서비스
+  운용을 검증했다. 단 **엔진의 ChatML 템플릿은 `<think>` 블록을 걸러주지 않으므로 잔여 태그 처리는
+  호출측 몫**이다 — `/no_think` 상태에서도 빈 블록(`<think></think>`), 여는 태그 없는 `</think>`,
+  닫는 태그 중복 같은 변종이 스트림 선두에 관찰되므로 호출측 필터가 필요하다. thinking 이 제거된
+  instruct 변형(Qwen3-4B-Instruct-2507 등)은 이런 처리 없이 ChatML 템플릿 그대로 동작한다 (검증 완료).
 - **생성 중 같은 모델은 직렬화된다.** KV 캐시가 요청 간 공유될 수 없어 세션 뮤텍스로 순차 처리한다.
   서로 다른 모델은 동시 생성된다. 다중 사용자 대규모 배치는 이 엔진의 비목표다 (vLLM 의 영역).
 - **토크나이저는 외부 `tokenizer.json` 을 쓴다.** 양자화 GGUF 저장소에 tokenizer.json 이 없으면
@@ -401,6 +405,46 @@ OpenAI 호환 `stop`(문자열 하나 또는 배열)을 지원한다. 생성 텍
 - `temperature = 0.0` — 결정적 탐욕 선택 (회귀 시험용)
 - `temperature > 0` + `top_k` — 고정 시드(`seed`) 기반 확률 샘플링. 같은 시드는 같은 출력
 - 다중 바이트 문자(한글 등)가 토큰 경계에 걸치면 완성될 때까지 방출을 보류한다 — 깨진 문자가 스트림에 나가지 않는다
+
+### wgpu 프리필 GEMM 오프로드 (실험적, RASE_GPU=1 옵트인)
+
+프리필의 양자화 선형층(Q4_K)을 GPU 로 오프로드하는 실험 경로다. 양자화 가중치를
+행렬 단위로 GPU 에 상주시키고 WGSL 셰이더 안에서 역양자화하며 곱한다 (역양자화된
+f32 를 매 호출 복사하면 수 GB 라 손해이기 때문). 디코드는 메모리 대역폭 바운드라
+내장 GPU 이득이 없어 항상 CPU 에 남는다.
+
+- **켜는 법**: `RASE_GPU=1` (기본 비활성). 현재 f32 셰이더는 통합 GPU 에서 CPU
+  하이브리드 GEMM 과 비슷한 속도라 기본값이 꺼져 있다. f16 셰이더 경로가 CPU 를
+  상회하면 기본 활성으로 바뀔 예정이다
+- **안전장치**: 소프트웨어 어댑터(WARP·llvmpipe 류, DeviceType Cpu)는 자동 제외 /
+  런타임 실패(디바이스 유실·매핑 실패) 시 그 즉시 전 과정이 CPU 경로로 복귀 /
+  Q4_K 외 dtype(Q6_K 등)과 GPU 부재 환경은 행렬 단위로 CPU 폴백
+- **진단**: Python `gpu_info()` 가 `active: <어댑터>` / `fallback(runtime-failure)` /
+  `inactive` 를 반환한다. 프로파일링 카운터 `gemm_gpu_ns`·`gemm_gpu_calls` 로
+  오프로드 몫을 계측한다 (위 성능 프로파일링 절)
+- **수치 특성**: GPU 역양자화 GEMM 은 연산 순서 차이로 CPU 와 비트 동일하지 않지만,
+  로짓 허용오차 내에서 일치한다 (같은 시드 greedy 디코드 출력 일치를 실측 확인)
+
+### 디코드 스레드 정책 (CANDLE_NUM_THREADS)
+
+디코드(토큰 생성)의 양자화 matvec 과 융합 어텐션은 `CANDLE_NUM_THREADS` 로 크기가 정해지는
+배리어 풀에서 정적 균등 분할로 돈다. 하이브리드 CPU(성능 코어 + 효율 코어 + 저전력 효율 코어
+혼합)에서는 매 배리어가 가장 느린 코어를 기다리게 되어, 코어를 전부 쓰는 기본값이 오히려
+디코드 처리량을 반토막 낸다 (16코어 Core Ultra 7 255H 실측: Qwen3-4B 디코드가 16스레드
+10 tok/s, 12스레드 20 tok/s. 절벽은 저전력 코어가 풀에 들어오는 지점에서 생긴다).
+
+엔진은 첫 모델 로드 시 다음 기본값을 적용한다:
+
+- `CANDLE_NUM_THREADS` 가 이미 설정돼 있으면 그대로 존중한다 (기본값 미적용)
+- 미설정이고 물리 코어가 12개 이상이면 `물리 코어 - 4` 로 설정한다. 디코드는 메모리
+  대역폭 바운드라 코어 수 이하에서 포화하므로, 균질 다코어 CPU 에서 이 상한의 손실은 작고
+  하이브리드 CPU 에서는 낙오자 페널티가 사라진다
+- 물리 코어 12개 미만이면 손대지 않는다
+
+프리필 경로(하이브리드 GEMM 의 f32 행렬곱, 블록형 어텐션)는 별도 rayon 풀
+(`RAYON_NUM_THREADS`, 기본 = 전체 물리 코어)을 쓰므로 이 정책의 영향을 받지 않는다.
+스레드 수는 작업 분할만 바꾸고 출력 원소별 계산 주체는 동일하므로, 같은 시드의 출력은
+스레드 수와 무관하게 같다.
 
 ---
 
@@ -507,7 +551,7 @@ pip install "git+https://github.com/arabangoo/rust_ai_serving_engine"
 ```python
 import rust_ai_serving_engine as engine
 
-engine.__version__                                  # "0.1.0"
+engine.__version__                                  # 예: "0.1.3"
 engine.probe_runtime(device="auto")                 # 장치 선택 + 텐서 스모크 테스트
 
 # 모델 수명주기 (store = 모델 저장소 폴더)
@@ -536,7 +580,55 @@ engine.generate_chat_stream_registered_gguf(store, id, messages, on_delta,
 
 # 생성 — 파일 직접 지정 (레지스트리 없이 1회성)
 engine.generate_llama_gguf(weights_path, tokenizer_path, prompt, ...)
+
+# 성능 프로파일링 — 포워드 패스 구간 카운터 (아래 "성능 프로파일링" 절)
+engine.profiling_snapshot(reset=True)               # JSON 문자열
+
+# wgpu 프리필 오프로드 상태 (8장 wgpu 절) — "active: <어댑터>" | "inactive"
+engine.gpu_info()
 ```
+
+### 성능 프로파일링 (RASE_PROFILE)
+
+포워드 패스의 구간별 소요 시간을 나노초 카운터로 집계하는 진단 표면이다.
+프리필을 "양자화 선형 GEMM 작업"과 "어텐션 커널 작업"으로, 디코드를 "양자화 matvec"과
+"융합 어텐션"으로 분해해, 커널 최적화나 GPU 오프로드의 이득 상한을 코드 작성 전에
+수치로 판단할 수 있게 한다.
+
+- **켜는 법**: 프로세스 시작 전에 환경변수 `RASE_PROFILE=1`. 프로세스당 1회만 읽으므로
+  실행 중 변경은 무효다. 꺼져 있으면(기본) 타이머를 아예 잡지 않아 추론 경로 비용이 0이고,
+  계측은 출력에 영향을 주지 않는다 (같은 시드는 켜고 꺼도 같은 출력).
+- **읽는 법**: `profiling_snapshot(reset=True)` 가 카운터 전체를 JSON 문자열로 반환한다.
+  `reset=True` 는 읽은 뒤 0으로 초기화하므로 연속 호출 사이가 곧 측정 창이 된다.
+- **적용 범위**: Qwen3 GGUF 디코더의 CPU 경로. 다른 디코더·장치에서는 카운터가 0에 머문다.
+
+| 카운터 | 의미 |
+|---|---|
+| `prefill_calls` / `prefill_tokens` | 시퀀스 길이 2 이상 forward 호출 수 / 처리한 프롬프트 토큰 수 |
+| `prefill_forward_ns` | 프리필 forward 전체 벽시계 (임베딩부터 logits 까지) |
+| `gemm_dequant_ns` / `gemm_matmul_ns` | 하이브리드 GEMM 경로의 역양자화 / f32 행렬곱 시간 |
+| `attn_blocked_ns` / `attn_flash_ns` | 프리필 어텐션 커널 시간 (블록형 / candle flash) |
+| `decode_steps` / `decode_forward_ns` | 단일 토큰 forward 수 / 벽시계 (디코드 tok/s 계산용) |
+| `decode_matvec_ns` / `decode_attn_ns` | 디코드의 양자화 matvec / 융합 어텐션 시간 |
+
+```python
+import json
+import os
+
+os.environ["RASE_PROFILE"] = "1"      # 반드시 첫 추론 전에
+import rust_ai_serving_engine as engine
+
+engine.generate_chat_registered_gguf("./models", "qwen3-4b", [...], max_tokens=256)
+p = json.loads(engine.profiling_snapshot(reset=True))
+prefill = p["prefill_forward_ns"] / 1e9
+gemm = (p["gemm_dequant_ns"] + p["gemm_matmul_ns"]) / 1e9
+attn = (p["attn_blocked_ns"] + p["attn_flash_ns"]) / 1e9
+print(f"prefill {prefill:.1f}s = GEMM {gemm:.1f}s + attention {attn:.1f}s + etc")
+print(f"decode {p['decode_steps'] / (p['decode_forward_ns'] / 1e9):.1f} tok/s")
+```
+
+주의: `decode_matvec_ns` 는 시퀀스 길이 1 선형 호출 전체를 세므로, 프리필 마지막의
+lm_head 호출(호출당 1회)도 포함된다. 디코드가 수백 토큰이면 오차는 1% 미만이다.
 
 ### 스트리밍 통합 레시피
 
@@ -755,6 +847,10 @@ rust_ai_serving_engine/
         lib.rs                            # load_gguf_decoder · GGUF EOS 추출
         llama_gguf.rs                     # Llama·Mistral GGUF 디코더
         qwen3_gguf.rs                     # Qwen3 GGUF 디코더
+        qwen3_model.rs                    # Qwen3 forward (하이브리드 프리필 GEMM + 블록 어텐션)
+        profiling.rs                      # RASE_PROFILE 구간 카운터 (11장 성능 프로파일링)
+        threading.rs                      # 디코드 스레드 기본 정책 (8장 디코드 스레드 정책)
+        gpu_gemm.rs                       # wgpu 프리필 GEMM 오프로드 (8장, RASE_GPU=1 옵트인)
         chat.rs                           # ChatTemplate (ChatML·Llama3·Mistral) + 렌더 테스트
         session.rs                        # ModelSession / SessionCache
         tokenizer.rs                      # LocalTokenizer (tokenizer.json)
