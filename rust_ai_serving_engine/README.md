@@ -1,84 +1,84 @@
 # rust_ai_serving_engine
 
-> **Rust 기반 로컬 AI 모델 서빙 엔진**
+> **A Rust-based local AI model serving engine**
 >
-> Hugging Face 에서 내려받은 GGUF 모델을 `등록 → 무결성 검증 → 로드 → 추론 → OpenAI 호환 API 서빙`으로 흘려보낸다.
-> Ollama · llama.cpp · LM Studio 가 제공하는 로컬 모델 실행 경험을
-> **순수 Rust 단일 바이너리 + Python 한 줄 import** 로 구현한다.
+> It moves a GGUF model downloaded from Hugging Face through `register -> verify integrity -> load -> infer -> serve over an OpenAI-compatible API`.
+> The local model experience offered by Ollama, llama.cpp, and LM Studio is reimplemented here
+> as a **pure-Rust single binary plus a one-line Python import**.
 
-이 문서는 엔진의 **완결된 개발자 매뉴얼**이다. 설계 원칙, 공개 API, 지원 모델,
-채팅 템플릿과 생성 제어, HTTP/CLI/Python 사용법, 서비스 통합, 새 아키텍처 추가법, 빌드·테스트 절차를 담는다.
+This document is the engine's **complete developer manual**. It covers the design principles, the public API, the supported models,
+chat templates and generation control, HTTP/CLI/Python usage, service integration, how to add a new architecture, and the build/test procedures.
 
-[주요 참고 논문]
+[Key reference papers]
 
-1. Attention Is All You Need (Transformer 구조의 원전) - https://arxiv.org/abs/1706.03762
-2. LLaMA: Open and Efficient Foundation Language Models (Llama 계열 디코더 구조) - https://arxiv.org/abs/2302.13971
-3. Efficiently Scaling Transformer Inference (추론을 프리필·디코드 국면으로 분해하고 연산량·메모리 대역폭 상한으로 성능을 분석하는 모델의 원전. RASE_PROFILE 구간 프로파일링의 이론 근거) - https://arxiv.org/abs/2211.05102
-4. The Case for 4-bit Precision: k-bit Inference Scaling Laws (4비트 양자화 추론의 근거) - https://arxiv.org/abs/2212.09720
-5. Efficient Memory Management for Large Language Model Serving with PagedAttention (LLM 서빙과 KV 캐시 관리) - https://arxiv.org/abs/2309.06180
-
----
-
-## 목차
-
-1. [핵심 특징](#1-핵심-특징)
-2. [빠른 시작](#2-빠른-시작)
-3. [설치와 Cargo Feature](#3-설치와-cargo-feature)
-4. [아키텍처](#4-아키텍처)
-5. [모델 매니페스트와 레지스트리](#5-모델-매니페스트와-레지스트리)
-6. [공개 API 레퍼런스](#6-공개-api-레퍼런스)
-7. [지원 모델](#7-지원-모델)
-8. [채팅 템플릿과 생성 제어](#8-채팅-템플릿과-생성-제어)
-9. [HTTP API (OpenAI 호환)](#9-http-api-openai-호환)
-10. [CLI 도구](#10-cli-도구)
-11. [Python 바인딩 (PyO3)](#11-python-바인딩-pyo3)
-12. [서비스 파이프라인에 붙이기](#12-서비스-파이프라인에-붙이기)
-13. [새 모델 아키텍처 추가하기](#13-새-모델-아키텍처-추가하기)
-14. [빌드 · Feature 조합 · 테스트](#14-빌드--feature-조합--테스트)
-15. [디렉토리 구조](#15-디렉토리-구조)
-16. [라이선스와 모델 책임](#16-라이선스와-모델-책임)
+1. Attention Is All You Need (the origin of the Transformer architecture): https://arxiv.org/abs/1706.03762
+2. LLaMA: Open and Efficient Foundation Language Models (the Llama-family decoder architecture): https://arxiv.org/abs/2302.13971
+3. Efficiently Scaling Transformer Inference (the origin of the model that decomposes inference into prefill and decode phases and analyzes performance by compute and memory-bandwidth bounds; the theoretical basis for RASE_PROFILE phase profiling): https://arxiv.org/abs/2211.05102
+4. The Case for 4-bit Precision: k-bit Inference Scaling Laws (the basis for 4-bit quantized inference): https://arxiv.org/abs/2212.09720
+5. Efficient Memory Management for Large Language Model Serving with PagedAttention (LLM serving and KV cache management): https://arxiv.org/abs/2309.06180
 
 ---
 
-## 1. 핵심 특징
+## Table of Contents
 
-로컬 대규모 언어모델(LLM) 실행에서 과소평가되는 영역이 **모델 수명주기와 서빙 계약**이다.
-추론 커널이 아무리 좋아도 "어떤 파일이 실행 가능한 모델인지, 지금 메모리에 무엇이 올라 있는지,
-같은 입력이 같은 출력을 내는지"가 관리되지 않으면 로컬 AI 는 재현 불가능한 장난감이 된다.
-이 엔진은 추론 커널을 새로 만드는 대신, 그 위아래의 시스템 엔지니어링을 책임지는 **런타임 틀**을 지향한다.
+1. [Core Features](#1-core-features)
+2. [Quick Start](#2-quick-start)
+3. [Installation and Cargo Features](#3-installation-and-cargo-features)
+4. [Architecture](#4-architecture)
+5. [Model Manifest and Registry](#5-model-manifest-and-registry)
+6. [Public API Reference](#6-public-api-reference)
+7. [Supported Models](#7-supported-models)
+8. [Chat Templates and Generation Control](#8-chat-templates-and-generation-control)
+9. [HTTP API (OpenAI-compatible)](#9-http-api-openai-compatible)
+10. [CLI Tools](#10-cli-tools)
+11. [Python Binding (PyO3)](#11-python-binding-pyo3)
+12. [Embedding into a Service Pipeline](#12-embedding-into-a-service-pipeline)
+13. [Adding a New Model Architecture](#13-adding-a-new-model-architecture)
+14. [Build, Features, and Tests](#14-build-features-and-tests)
+15. [Directory Structure](#15-directory-structure)
+16. [License and Model Responsibility](#16-license-and-model-responsibility)
 
-| 원칙 | 의미 |
+---
+
+## 1. Core Features
+
+The most underrated part of running a local large language model (LLM) is the **model lifecycle and the serving contract**.
+No matter how good the inference kernel is, if "which file is an executable model, what is loaded in memory right now,
+and whether the same input yields the same output" is not managed, local AI turns into an irreproducible toy.
+Instead of writing a new inference kernel, this engine aims to be the **runtime framework** that owns the systems engineering above and below the kernel.
+
+| Principle | Meaning |
 |---|---|
-| **커널은 만들지 않고 조립한다** | 텐서 연산·모델 구현은 Hugging Face 의 Rust 프레임워크 Candle 을 쓴다. 엔진의 차별점은 모델 수명주기(등록·검증·로드·캐시·언로드)와 서빙 계약이다. 단 CPU 프리필은 예외적으로 자체 하이브리드 커널 경로를 갖는다(아래). |
-| **하이브리드 프리필 + GQA 디코드** | Candle 의 양자화 행렬곱은 프롬프트 토큰마다 가중치 전체를 다시 역양자화해 프리필이 디코드만큼 느리다. 엔진은 긴 프롬프트에서 레이어별 가중치를 1회만 역양자화해 f32 행렬곱(GEMM)으로 처리하고, 디코드는 메모리 최적인 양자화 커널을 유지한다. 긴 프롬프트의 어텐션도 자체 블록형 커널(질의 16행이 K/V 읽기를 공유, online softmax 정확 계산)로 처리하며 — 16코어 AVX2 노트북 실측 기준 1,500자 문서 컨텍스트의 첫 토큰이 141초에서 20초로, 4,000자는 97초에서 48초로 단축 — 디코드 어텐션도 KV 공유비가 큰 GQA 모델(쿼리:KV 가 2:1 초과, 예: Qwen3-4B 의 32:8)에서 KV 를 1회만 읽고 그룹의 쿼리 헤드 전체를 갱신하는 자체 커널로 중복 읽기를 제거한다. |
-| **매니페스트가 곧 계약** | 모델 파일은 SHA-256 해시·아키텍처·토크나이저·채팅 템플릿이 기록된 TOML 매니페스트로만 실행된다. "실행 가능한 모델"과 "그냥 큰 파일"을 구분한다. |
-| **결정적 생성** | 같은 모델·프롬프트·시드·샘플링 설정이면 같은 출력. 고정 시드 샘플러와 결정적 생성 루프로 회귀 시험이 가능하다. |
-| **한 번 로드, 계속 재사용** | 프로세스 전역 세션 캐시가 해시 검증·모델 로드를 최초 1회만 수행한다. 요청마다 수 GB 를 다시 읽지 않는다. |
-| **순수 Rust / zero 외부 런타임** | C++ llama.cpp 래퍼가 아니다. Python·Node.js·외부 프로세스 없이 단일 바이너리로 동작하고, Python 은 PyO3 확장 모듈로 붙는다. |
+| **Assemble the kernel, do not build it** | Tensor operations and model implementations come from Candle, Hugging Face's Rust framework. The engine's differentiator is the model lifecycle (register, verify, load, cache, unload) and the serving contract. The one exception is CPU prefill, which has its own hybrid kernel path (below). |
+| **Hybrid prefill plus GQA decode** | Candle's quantized matmul re-dequantizes the entire weight for every prompt token, which makes prefill as slow as decode. For long prompts the engine dequantizes each layer's weights only once and processes them with an f32 matmul (GEMM), while decode keeps the memory-optimal quantized kernel. Attention over a long prompt is also handled by a custom blocked kernel (16 query rows share the K/V reads, computed with an exact online softmax). On a 16-core AVX2 laptop, the first token for a 1,500-character document context drops from 141s to 20s, and 4,000 characters from 97s to 48s. Decode attention likewise uses a custom kernel for GQA models with a high KV sharing ratio (query:KV above 2:1, e.g. Qwen3-4B at 32:8): it reads the KV once and updates every query head in the group, removing redundant reads. |
+| **The manifest is the contract** | A model file is only executable through a TOML manifest that records its SHA-256 hash, architecture, tokenizer, and chat template. It separates "an executable model" from "just a big file". |
+| **Deterministic generation** | The same model, prompt, seed, and sampling settings produce the same output. A fixed-seed sampler and a deterministic generation loop make regression testing possible. |
+| **Load once, reuse continuously** | A process-global session cache performs hash verification and model loading only on the first call. It does not re-read several GB per request. |
+| **Pure Rust, zero external runtime** | This is not a wrapper around C++ llama.cpp. It runs as a single binary with no Python, Node.js, or external process, and Python attaches as a PyO3 extension module. |
 
-### Ollama 와 무엇이 같고 무엇이 다른가
+### What is the same as Ollama, and what is different
 
-사용자 경험의 목표는 같다 — 모델을 받아서, 등록하고, 로컬에서 대화한다. 구현 철학이 다르다.
+The user-experience goal is the same: get a model, register it, and chat locally. The implementation philosophy differs.
 
-- Ollama 는 llama.cpp(C++)를 감싼 Go 서버다. 이 엔진은 **전 계층이 Rust** 라서 하나의
-  Cargo 워크스페이스에서 타입 안전하게 조립되고, 라이브러리·CLI·Python 확장이 같은 코어를 공유한다.
-- 모델 관리가 암묵적 캐시가 아니라 **명시적 매니페스트**다. 가중치·토크나이저의 해시가 기록되고,
-  로드 전 무결성이 검증되며, 파일이 바뀌면 캐시가 자동 무효화된다.
-- 임베드가 1급 시나리오다. 서버를 따로 켜지 않아도 Rust crate 또는 Python 모듈로
-  **호스트 서비스 프로세스 안에서** 직접 추론할 수 있다.
+- Ollama is a Go server wrapping llama.cpp (C++). This engine is **Rust across every layer**, so it is assembled
+  type-safely in a single Cargo workspace, and the library, CLI, and Python extension share the same core.
+- Model management is an **explicit manifest** rather than an implicit cache. Weight and tokenizer hashes are recorded,
+  integrity is verified before load, and the cache is invalidated automatically when a file changes.
+- Embedding is a first-class scenario. Without starting a separate server, you can run inference directly
+  **inside the host service process** as a Rust crate or a Python module.
 
 ---
 
-## 2. 빠른 시작
+## 2. Quick Start
 
-세 표면(CLI 서버, Python, Rust) 모두 같은 흐름이다 — 모델을 받아 등록하고, 토크나이저를 붙이고, 생성한다.
+All three surfaces (CLI server, Python, Rust) follow the same flow: get a model, register it, attach a tokenizer, and generate.
 
-### CLI — 모델 받기부터 OpenAI 호환 서버까지
+### CLI: from pulling a model to an OpenAI-compatible server
 
 ```bash
 cargo build --release
 
-# 1) Hugging Face 에서 가중치 + tokenizer.json 을 받아 실행 가능한 번들로 등록
+# 1) Download weights + tokenizer.json from Hugging Face and register as an executable bundle
 ./target/release/rust-ai-serving-engine model pull \
   --repo unsloth/Qwen3-4B-Instruct-2507-GGUF \
   --file Qwen3-4B-Instruct-2507-Q4_K_M.gguf \
@@ -87,15 +87,15 @@ cargo build --release
   --tokenizer-repo Qwen/Qwen3-4B-Instruct-2507 \
   --tokenizer-file tokenizer.json
 
-# 2) OpenAI 호환 서버 기동
+# 2) Start the OpenAI-compatible server
 ./target/release/rust-ai-serving-engine serve --port 8080
 ```
 
 ```bash
-# 3) 어떤 OpenAI 클라이언트로든 대화 (스트리밍은 "stream": true)
+# 3) Chat with any OpenAI client (streaming with "stream": true)
 curl -s http://127.0.0.1:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"model": "qwen3-4b", "messages": [{"role": "user", "content": "안녕?"}]}'
+  -d '{"model": "qwen3-4b", "messages": [{"role": "user", "content": "Hello?"}]}'
 ```
 
 ### Python
@@ -103,21 +103,21 @@ curl -s http://127.0.0.1:8080/v1/chat/completions \
 ```python
 import rust_ai_serving_engine as engine
 
-# 등록 (최초 1회) — 가중치 다운로드 + 로컬 tokenizer.json 연결
+# Register (once): download weights + link a local tokenizer.json
 engine.pull_model("./models", "unsloth/Qwen3-4B-Instruct-2507-GGUF",
                   "Qwen3-4B-Instruct-2507-Q4_K_M.gguf", "qwen3-4b", architecture="qwen3")
 engine.attach_tokenizer("./models", "qwen3-4b", "./tokenizer.json")
 
-# 대화 — 채팅 템플릿·종료 토큰 자동 적용, 모델은 프로세스 캐시에 상주
+# Chat: chat template and stop token applied automatically, model stays resident in the process cache
 answer = engine.generate_chat_registered_gguf(
     "./models", "qwen3-4b",
-    [{"role": "user", "content": "한 문장으로 자기소개 해줘."}],
+    [{"role": "user", "content": "Introduce yourself in one sentence."}],
     max_tokens=64,
 )
 print(answer)
 ```
 
-### Rust 라이브러리
+### Rust library
 
 ```rust
 use rust_ai_serving_engine_core::{DevicePreference, GenerationConfig, ModelRegistry, generate};
@@ -127,7 +127,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let registry = ModelRegistry::open("./models")?;
     let cache = SessionCache::new();
 
-    // 최초 호출: 해시 검증 + 로드 / 이후: 메모리 상주 세션 재사용
+    // First call: hash verification + load / afterwards: reuse the memory-resident session
     let session = cache.get_or_load(&registry, "qwen3-4b", DevicePreference::Auto)?;
     let mut session = session.lock().unwrap();
 
@@ -140,7 +140,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut config = GenerationConfig::default();
     if let Some(eos) = session.eos_token {
-        config.stop_tokens.push(eos); // 종료 토큰에서 생성 자동 종료
+        config.stop_tokens.push(eos); // generation stops automatically at the stop token
     }
     let result = generate(session.decoder.as_mut(), &prompt_tokens, &config, || false)?;
     println!("{}", session.tokenizer.decode(&result.tokens, true)?);
@@ -150,9 +150,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ---
 
-## 3. 설치와 Cargo Feature
+## 3. Installation and Cargo Features
 
-Rust 프로젝트의 `Cargo.toml`:
+In a Rust project's `Cargo.toml`:
 
 ```toml
 [dependencies]
@@ -160,131 +160,131 @@ rust-ai-serving-engine-core = { git = "https://github.com/arabangoo/rust_ai_serv
 rust-ai-serving-engine-models = { git = "https://github.com/arabangoo/rust_ai_serving_engine" }
 ```
 
-### 워크스페이스 크레이트 구성
+### Workspace crates
 
-| 크레이트 | 역할 | 주요 의존 |
+| Crate | Role | Key dependencies |
 |---|---|---|
-| `rust_ai_serving_engine_core` | 매니페스트·레지스트리·생성 루프·샘플러·장치 선택·에러 계약 | `candle-core`, `hf-hub`, `sha2` |
-| `rust_ai_serving_engine_models` | GGUF 디코더(Llama·Qwen3)·토크나이저·채팅 템플릿·세션 캐시 | `candle-transformers`, `tokenizers` |
-| `rust_ai_serving_engine_api` | OpenAI 호환 HTTP API 와 SSE 스트리밍 | `axum`, `tokio` |
-| `rust_ai_serving_engine_cli` | `model`·`runtime`·`serve` 명령줄 (바이너리명 `rust-ai-serving-engine`) | `clap` |
-| `rust_ai_serving_engine_python` | PyO3 확장 모듈 (모듈명 `rust_ai_serving_engine`) | `pyo3`(abi3) |
+| `rust_ai_serving_engine_core` | Manifest, registry, generation loop, sampler, device selection, error contract | `candle-core`, `hf-hub`, `sha2` |
+| `rust_ai_serving_engine_models` | GGUF decoders (Llama, Qwen3), tokenizer, chat templates, session cache | `candle-transformers`, `tokenizers` |
+| `rust_ai_serving_engine_api` | OpenAI-compatible HTTP API and SSE streaming | `axum`, `tokio` |
+| `rust_ai_serving_engine_cli` | `model`, `runtime`, `serve` command line (binary name `rust-ai-serving-engine`) | `clap` |
+| `rust_ai_serving_engine_python` | PyO3 extension module (module name `rust_ai_serving_engine`) | `pyo3` (abi3) |
 
-### Feature 목록
+### Feature list
 
-| Feature | 크레이트 | 활성화 대상 | 비고 |
+| Feature | Crate | Enables | Notes |
 |---|---|---|---|
-| **`cpu`** | core, models | CPU 실행 (기본 활성) | 순수 Rust, 외부 런타임 없음 |
-| `cuda` | core, models | NVIDIA GPU 실행 경로 | `candle-core/cuda` 전달 |
-| `metal` | core, models | Apple Silicon GPU 실행 경로 | `candle-core/metal` 전달 |
-| **`python`** | python | PyO3 cdylib 바인딩 | maturin 이 자동 활성화 |
+| **`cpu`** | core, models | CPU execution (enabled by default) | Pure Rust, no external runtime |
+| `cuda` | core, models | NVIDIA GPU execution path | Forwards `candle-core/cuda` |
+| `metal` | core, models | Apple Silicon GPU execution path | Forwards `candle-core/metal` |
+| **`python`** | python | PyO3 cdylib binding | Enabled automatically by maturin |
 
-> 기본(CPU) 빌드는 외부 공유 라이브러리나 subprocess 를 요구하지 않는다. 모델 파일과 바이너리 하나면
-> 오프라인·에어갭 환경에서도 동작한다 (Hugging Face 다운로드는 `model pull` 사용 시에만 필요).
+> The default (CPU) build requires no external shared library or subprocess. With just the model file and a single binary,
+> it runs in offline and air-gapped environments (Hugging Face download is only needed when using `model pull`).
 
 ---
 
-## 4. 아키텍처
+## 4. Architecture
 
 ```text
-요청(HTTP/CLI/Python)
-  → 레지스트리: 매니페스트 조회 (아키텍처·토크나이저·템플릿·해시)
-  → 세션 캐시: 최초 1회만 해시 검증 + 디코더·토크나이저 로드
-  → 채팅 템플릿 렌더 → 토크나이즈
-  → prefill: 프롬프트 전체 평가 + KV 캐시 생성
-  → decode: 토큰 샘플링 → KV 캐시 갱신 반복 (종료 토큰·stop 문자열·취소 확인)
-  → 토큰 콜백 → SSE 델타 전송 또는 완성 텍스트 조립
+request (HTTP/CLI/Python)
+  -> registry: look up the manifest (architecture, tokenizer, template, hash)
+  -> session cache: hash verification + load the decoder and tokenizer, only once
+  -> render the chat template -> tokenize
+  -> prefill: evaluate the whole prompt + build the KV cache
+  -> decode: sample a token -> update the KV cache, repeat (stop token, stop string, cancellation check)
+  -> token callback -> send an SSE delta or assemble the completed text
 ```
 
-핵심은 **계약의 분리**다. `core` 는 추론 백엔드를 포함하지 않고 매니페스트·생성 루프·트레이트만 정의한다.
-`models` 는 그 계약의 Candle 구현체다. HTTP·CLI·Python 은 같은 `models` 위의 세 가지 표면일 뿐이다.
+The heart of it is the **separation of contracts**. `core` contains no inference backend; it only defines the manifest, the generation loop, and the traits.
+`models` is the Candle implementation of that contract. HTTP, CLI, and Python are just three surfaces over the same `models`.
 
-- **등록** — [`ModelRegistry`](#61-modelregistry--core) 가 가중치를 해시하고 TOML 매니페스트를 원자적으로 기록한다.
-- **로드** — [`SessionCache`](#63-modelsession--sessioncache--models) 가 매니페스트 해시가 같으면 메모리 상주 세션을 재사용하고, 다르면 검증 후 재로드한다.
-- **생성** — [`generate` / `generate_with`](#62-생성-계약--core) 가 아키텍처 중립 디코드 루프를 돌린다. KV(Key-Value) 캐시는 디코더가 소유한다.
-- **직렬화** — 같은 모델에 대한 동시 요청은 세션 뮤텍스로 직렬화된다 (KV 캐시는 공유 불가). 서로 다른 모델은 동시 생성된다.
+- **Register**: [`ModelRegistry`](#61-modelregistry-core) hashes the weights and writes the TOML manifest atomically.
+- **Load**: [`SessionCache`](#63-modelsession-and-sessioncache-models) reuses the memory-resident session when the manifest hash matches, and verifies and reloads when it differs.
+- **Generate**: [`generate` / `generate_with`](#62-generation-contract-core) runs the architecture-neutral decode loop. The decoder owns the KV (Key-Value) cache.
+- **Serialize**: concurrent requests for the same model are serialized by the session mutex (the KV cache cannot be shared). Different models generate concurrently.
 
 ---
 
-## 5. 모델 매니페스트와 레지스트리
+## 5. Model Manifest and Registry
 
-모델 저장소(store)는 폴더 하나다. `manifests/` 아래 모델당 TOML 파일 하나가 기록된다.
+A model store is a single folder. Under `manifests/`, one TOML file is written per model.
 
 ```toml
 id = "qwen3-4b"
 kind = "generator"                 # generator | embedding
 format = "gguf"                    # gguf | safetensors
-weights = "<가중치 파일 절대 경로>"
-sha256 = "<가중치 SHA-256>"
-tokenizer = "<tokenizer.json 절대 경로>"
-tokenizer_sha256 = "<토크나이저 SHA-256>"
+weights = "<absolute path to the weight file>"
+sha256 = "<weight SHA-256>"
+tokenizer = "<absolute path to tokenizer.json>"
+tokenizer_sha256 = "<tokenizer SHA-256>"
 architecture = "qwen3"
 context_length = 262144
-chat_template = "chatml"           # chatml | llama3 | mistral (생략 시 아키텍처 기본값)
+chat_template = "chatml"           # chatml | llama3 | mistral (defaults to the architecture default if omitted)
 ```
 
-매니페스트는 실행 가능한 모델과 단순 파일을 구분하는 계약이다:
+The manifest is the contract that distinguishes an executable model from a plain file:
 
-- **무결성** — `verify` 는 가중치·토크나이저의 SHA-256 을 재계산해 매니페스트와 대조한다.
-  세션 캐시도 로드 시점에 같은 검증을 수행하고, 해시가 달라지면 캐시를 버리고 재로드한다.
-- **실행 가능 조건** — 생성에는 `format = "gguf"` + `architecture` + `tokenizer` 세 가지가 필요하다.
-  하나라도 없으면 로드 단계에서 무엇이 빠졌는지 명시하고 거절한다.
-- **가중치 파일 위치** — `model pull` 은 Hugging Face 캐시에 내려받은 파일을 매니페스트로 가리킨다.
-  캐시를 정리하면 모델을 다시 받아야 한다. 장기 보관할 모델은 원하는 폴더로 옮긴 뒤 `model import` 로 등록한다.
+- **Integrity**: `verify` recomputes the SHA-256 of the weights and tokenizer and compares against the manifest.
+  The session cache runs the same check at load time, and if the hash has changed it discards the cache and reloads.
+- **Executable conditions**: generation requires three things, `format = "gguf"` + `architecture` + `tokenizer`.
+  If any is missing, the load stage states exactly what is absent and refuses.
+- **Weight file location**: `model pull` points the manifest at the file it downloaded into the Hugging Face cache.
+  Clearing the cache means the model must be downloaded again. For a model you want to keep, move it to a folder of your choice and register it with `model import`.
 
 ---
 
-## 6. 공개 API 레퍼런스
+## 6. Public API Reference
 
-### 6.1 `ModelRegistry` — core
+### 6.1 `ModelRegistry` (core)
 
 ```rust
-ModelRegistry::open(root) -> Result<Self>          // store 폴더 열기(없으면 생성)
+ModelRegistry::open(root) -> Result<Self>          // open the store folder (create if absent)
 
 fn import_local(&self, id, weights, kind: ModelKind,
                 architecture: Option<String>, context_length: Option<u32>,
                 chat_template: Option<String>) -> Result<ImportedModel>
 fn attach_tokenizer(&self, id, tokenizer_path) -> Result<ModelManifest>
-fn get(&self, id) -> Result<ModelManifest>         // 매니페스트 조회 (해시 재계산 없음)
-fn list(&self) -> Result<Vec<ModelManifest>>       // id 정렬 목록
-fn verify(&self, id) -> Result<ModelManifest>      // 가중치·토크나이저 해시 재검증
+fn get(&self, id) -> Result<ModelManifest>         // look up the manifest (no hash recompute)
+fn list(&self) -> Result<Vec<ModelManifest>>       // list sorted by id
+fn verify(&self, id) -> Result<ModelManifest>      // re-verify the weight and tokenizer hashes
 ```
 
-`HuggingFaceHub::download(repo, file) -> Result<PathBuf>` 가 Hugging Face Hub 공개 파일을
-관리 캐시에 내려받는다 (core, `hf-hub` 기반).
+`HuggingFaceHub::download(repo, file) -> Result<PathBuf>` downloads a public file from the Hugging Face Hub
+into the managed cache (core, based on `hf-hub`).
 
-### 6.2 생성 계약 — core
+### 6.2 Generation Contract (core)
 
 ```rust
-/// 로드된 모델이 구현하는 아키텍처 중립 디코더 계약.
+/// The architecture-neutral decoder contract implemented by a loaded model.
 pub trait TokenDecoder: Send {
-    fn prefill(&mut self, prompt: &[u32]) -> Result<Vec<f32>>;  // KV 캐시 초기화 + 첫 logits
-    fn decode(&mut self, token: u32) -> Result<Vec<f32>>;       // 토큰 1개 평가 → 다음 logits
-    fn eos_token(&self) -> Option<u32> { None }                 // 모델 파일이 선언한 종료 토큰
+    fn prefill(&mut self, prompt: &[u32]) -> Result<Vec<f32>>;  // init the KV cache + first logits
+    fn decode(&mut self, token: u32) -> Result<Vec<f32>>;       // evaluate one token -> next logits
+    fn eos_token(&self) -> Option<u32> { None }                 // the stop token declared by the model file
 }
 
 pub struct GenerationConfig {
-    pub max_tokens: usize,        // 기본 256
-    pub temperature: f32,         // 기본 0.7 (0.0 = 탐욕적 선택)
-    pub top_k: Option<usize>,     // 기본 Some(40)
-    pub seed: u64,                // 기본 0 — 같은 시드는 같은 출력
-    pub stop_tokens: Vec<u32>,    // 이 토큰이 나오면 즉시 종료
+    pub max_tokens: usize,        // default 256
+    pub temperature: f32,         // default 0.7 (0.0 = greedy selection)
+    pub top_k: Option<usize>,     // default Some(40)
+    pub seed: u64,                // default 0 - the same seed gives the same output
+    pub stop_tokens: Vec<u32>,    // generation stops immediately when this token appears
 }
 
-// 완성형 생성 — 취소 콜백이 true 를 반환하면 중단
+// Completion-style generation: aborts when the cancel callback returns true
 generate(decoder, prompt, &config, cancelled) -> Result<GenerationResult>
 
-// 스트리밍용 — 토큰마다 on_token 이 불리고, false 반환 시 디코딩 중단
+// For streaming: on_token is called per token, and returning false stops decoding
 generate_with(decoder, prompt, &config, cancelled, on_token) -> Result<GenerationResult>
 
 pub struct GenerationResult { pub tokens: Vec<u32>, pub stop_reason: GenerationStopReason }
 pub enum GenerationStopReason { MaxTokens, StopToken, Cancelled }
 ```
 
-### 6.3 `ModelSession` · `SessionCache` — models
+### 6.3 `ModelSession` and `SessionCache` (models)
 
 ```rust
-/// 로드된 모델 1개 — 디코더 + 토크나이저 + 종료 토큰 + 채팅 템플릿.
+/// One loaded model: decoder + tokenizer + stop token + chat template.
 pub struct ModelSession {
     pub decoder: Box<dyn TokenDecoder>,
     pub tokenizer: LocalTokenizer,
@@ -293,38 +293,38 @@ pub struct ModelSession {
 }
 ModelSession::load(&manifest, &runtime) -> Result<Self>
 
-/// 프로세스 전역 세션 캐시. 키 = 모델 id + 장치.
+/// Process-global session cache. Key = model id + device.
 SessionCache::new() -> Self
 fn get_or_load(&self, registry, id, device: DevicePreference)
-    -> Result<Arc<Mutex<ModelSession>>>   // 해시 불변이면 재사용, 변경이면 검증 후 재로드
-fn clear(&self)                            // 전체 언로드 (메모리 해제)
+    -> Result<Arc<Mutex<ModelSession>>>   // reuse if the hash is unchanged, verify and reload if changed
+fn clear(&self)                            // unload everything (free memory)
 ```
 
-### 6.4 디코더·토크나이저 — models
+### 6.4 Decoder and Tokenizer (models)
 
 ```rust
-// 등록된 아키텍처 이름으로 GGUF 디코더 선택
+// Select a GGUF decoder by the registered architecture name
 load_gguf_decoder(architecture, weights, &runtime) -> Result<Box<dyn TokenDecoder>>
 
-LlamaGgufDecoder::load(path, &runtime) -> Result<Self>   // Llama·Mistral 호환 GGUF
-Qwen3GgufDecoder::load(path, &runtime) -> Result<Self>   // Qwen3 호환 GGUF
+LlamaGgufDecoder::load(path, &runtime) -> Result<Self>   // Llama/Mistral-compatible GGUF
+Qwen3GgufDecoder::load(path, &runtime) -> Result<Self>   // Qwen3-compatible GGUF
 
 LocalTokenizer::from_file(path) -> Result<Self>           // Hugging Face tokenizer.json
 fn encode(&self, text, add_special_tokens: bool) -> Result<Vec<u32>>
 fn decode(&self, tokens, skip_special_tokens: bool) -> Result<String>
 ```
 
-### 6.5 장치 선택 — core
+### 6.5 Device Selection (core)
 
 ```rust
-pub enum DevicePreference { Auto, Cpu, Cuda, Metal }   // Auto = CUDA → Metal → CPU 폴백
+pub enum DevicePreference { Auto, Cpu, Cuda, Metal }   // Auto = CUDA -> Metal -> CPU fallback
 
 RuntimeDevice::select(preference) -> Result<RuntimeDevice>
-fn smoke_test(&self) -> Result<()>     // 실제 텐서 연산으로 백엔드 동작 확인
+fn smoke_test(&self) -> Result<()>     // confirm the backend works with a real tensor op
 fn is_accelerated(&self) -> bool
 ```
 
-### 6.6 에러 타입 — core
+### 6.6 Error Types (core)
 
 ```rust
 pub enum EngineError {
@@ -337,130 +337,132 @@ pub enum EngineError {
 }
 ```
 
-> 로드 실패는 원인별로 구분된다 — 손상 파일·해시 불일치·미지원 아키텍처·백엔드 부재가 각각 다른
-> 에러로 보고되므로, 호출자는 "왜 안 되는지"를 사용자에게 그대로 전달할 수 있다.
+> Load failures are distinguished by cause. A corrupt file, a hash mismatch, an unsupported architecture, and a missing backend
+> are each reported as a different error, so the caller can pass "why it failed" straight through to the user.
 
 ---
 
-## 7. 지원 모델
+## 7. Supported Models
 
-실행 형식은 GGUF 양자화 모델이고, 아키텍처 이름이 디코더를 고른다.
+The execution format is GGUF quantized models, and the architecture name selects the decoder.
 
-| 아키텍처 (`--architecture`) | 디코더 | 대표 모델 |
+| Architecture (`--architecture`) | Decoder | Representative models |
 |---|---|---|
-| `qwen3` | `Qwen3GgufDecoder` (Candle quantized_qwen3) | Qwen3-1.7B · Qwen3-4B-Instruct-2507 — 실모델로 채팅 완성·SSE 스트리밍·한국어 다중 바이트·세션 캐시 재사용까지 종단 간 검증. 디코드 실측(16코어 하이브리드 CPU 노트북, 짧은 컨텍스트 기준): 1.7B q4 약 초당 40-46토큰, 4B q4 약 초당 20토큰 (8장 디코드 스레드 정책 적용 시) |
-| `llama` `llama2` `llama3` `mistral` `mixtral` | `LlamaGgufDecoder` (Candle quantized_llama) | Llama 2·3, Mistral, Mixtral instruct 계열 |
+| `qwen3` | `Qwen3GgufDecoder` (Candle quantized_qwen3) | Qwen3-1.7B, Qwen3-4B-Instruct-2507. Verified end to end with real models: chat completion, SSE streaming, Korean multi-byte characters, and session-cache reuse. Measured decode (16-core hybrid CPU laptop, short context): 1.7B q4 about 40-46 tokens/s, 4B q4 about 20 tokens/s (with the 8-thread decode policy applied). |
+| `llama` `llama2` `llama3` `mistral` `mixtral` | `LlamaGgufDecoder` (Candle quantized_llama) | Llama 2/3, Mistral, Mixtral instruct family |
 
-동작 메모:
+Operational notes:
 
-- **지원 밖 아키텍처는 잘못된 출력 대신 명확한 에러로 거절한다.** `qwen2` 는 Qwen3 GGUF 사용을 안내하는
-  에러를, `phi` 는 지원 제외 사유를 담은 에러를 반환한다. Safetensors 는 레지스트리 등록·해시 검증 대상이고
-  실행은 GGUF 로 한다.
-- **Qwen3 하이브리드(thinking) 모델은 `/no_think` 로 다룬다.** Qwen3 기본판(0.6B·1.7B 등)은 답변 전
-  `<think>` 추론 블록을 생성하는 하이브리드 모델이다. CPU 서빙에서는 시스템 프롬프트에 Qwen 공식
-  소프트 스위치 `/no_think` 를 붙여 추론을 끄는 것이 정석이며, 이 방식으로 Qwen3-1.7B 실서비스
-  운용을 검증했다. 단 **엔진의 ChatML 템플릿은 `<think>` 블록을 걸러주지 않으므로 잔여 태그 처리는
-  호출측 몫**이다 — `/no_think` 상태에서도 빈 블록(`<think></think>`), 여는 태그 없는 `</think>`,
-  닫는 태그 중복 같은 변종이 스트림 선두에 관찰되므로 호출측 필터가 필요하다. thinking 이 제거된
-  instruct 변형(Qwen3-4B-Instruct-2507 등)은 이런 처리 없이 ChatML 템플릿 그대로 동작한다 (검증 완료).
-- **생성 중 같은 모델은 직렬화된다.** KV 캐시가 요청 간 공유될 수 없어 세션 뮤텍스로 순차 처리한다.
-  서로 다른 모델은 동시 생성된다. 다중 사용자 대규모 배치는 이 엔진의 비목표다 (vLLM 의 영역).
-- **토크나이저는 외부 `tokenizer.json` 을 쓴다.** 양자화 GGUF 저장소에 tokenizer.json 이 없으면
-  원본 모델 저장소에서 받아 붙인다 (`model pull --tokenizer-repo` 가 이를 한 번에 처리).
+- **Unsupported architectures are refused with a clear error instead of wrong output.** `qwen2` returns an error
+  guiding you to use a Qwen3 GGUF, and `phi` returns an error stating why it is excluded. Safetensors can be registered and
+  hash-verified in the registry, but execution runs on GGUF.
+- **Qwen3 hybrid (thinking) models are handled with `/no_think`.** The Qwen3 base editions (0.6B, 1.7B, and so on) are hybrid
+  models that emit a `<think>` reasoning block before answering. For CPU serving, the standard approach is to disable reasoning
+  by adding Qwen's official soft switch `/no_think` to the system prompt, and this is how the Qwen3-1.7B production run was
+  validated. However, **the engine's ChatML template does not filter out `<think>` blocks, so handling any residual tags is the
+  caller's responsibility.** Even in the `/no_think` state, variants such as an empty block (`<think></think>`), a `</think>`
+  with no opening tag, or a duplicated closing tag are observed at the head of the stream, so a caller-side filter is needed.
+  The thinking-removed instruct variants (Qwen3-4B-Instruct-2507 and similar) work with the ChatML template as is, without such
+  handling (verified).
+- **The same model is serialized during generation.** Because the KV cache cannot be shared across requests, it is processed
+  sequentially via the session mutex. Different models generate concurrently. Large multi-user batching is a non-goal of this
+  engine (that is vLLM's domain).
+- **The tokenizer uses an external `tokenizer.json`.** If a quantized GGUF repository has no tokenizer.json, download it from the
+  original model repository and attach it (`model pull --tokenizer-repo` handles this in one step).
 
 ---
 
-## 8. 채팅 템플릿과 생성 제어
+## 8. Chat Templates and Generation Control
 
-instruct 모델은 학습 때 쓰인 대화 마크업을 그대로 재현해야 정상 동작한다. 엔진은 대화 메시지 목록을
-모델별 마크업으로 렌더하고, 종료 토큰에서 생성을 자동으로 끝낸다.
+An instruct model works correctly only when the conversation markup used during training is reproduced exactly. The engine renders
+a list of conversation messages into the per-model markup and ends generation automatically at the stop token.
 
-### 템플릿 선택 규칙
+### Template selection rules
 
-1. 매니페스트의 `chat_template` 값(`chatml` | `llama3` | `mistral`)이 있으면 그것을 쓴다.
-2. 없으면 아키텍처 기본값 — `qwen3` → ChatML, `llama3` → Llama3, `llama`·`llama2`·`mistral`·`mixtral` → Mistral `[INST]`.
-3. 어느 쪽도 없으면 채팅 요청을 거절한다 (완성 API 는 템플릿 없이 동작).
+1. If the manifest's `chat_template` value (`chatml` | `llama3` | `mistral`) is present, use it.
+2. Otherwise use the architecture default: `qwen3` -> ChatML, `llama3` -> Llama3, `llama`/`llama2`/`mistral`/`mixtral` -> Mistral `[INST]`.
+3. If neither is present, the chat request is refused (the completion API works without a template).
 
-| 템플릿 | 마크업 | 대상 |
+| Template | Markup | Target |
 |---|---|---|
-| `chatml` | `<|im_start|>role ... <|im_end|>` | Qwen 계열, 다수 ChatML 파인튜닝 |
+| `chatml` | `<|im_start|>role ... <|im_end|>` | Qwen family, many ChatML fine-tunes |
 | `llama3` | `<|start_header_id|>role<|end_header_id|> ... <|eot_id|>` | Llama 3 instruct |
-| `mistral` | `<s>[INST] ... [/INST]` (system 은 다음 user 턴에 병합) | Mistral·Llama 2 instruct |
+| `mistral` | `<s>[INST] ... [/INST]` (system is merged into the following user turn) | Mistral/Llama 2 instruct |
 
-템플릿이 특수 토큰을 직접 표기하므로, 채팅 프롬프트는 토크나이저의 자동 특수 토큰 없이 인코딩된다.
+Because the template writes the special tokens directly, the chat prompt is encoded without the tokenizer's automatic special tokens.
 
-### 종료 토큰(EOS) 자동 종료
+### Automatic stop at the end-of-sequence (EOS) token
 
-GGUF 메타데이터의 `tokenizer.ggml.eos_token_id` 를 로드 시 읽어 두고, HTTP·Python 채팅 표면이
-자동으로 stop 토큰에 추가한다. 사용자가 토큰 id 를 알 필요가 없다.
+The `tokenizer.ggml.eos_token_id` from the GGUF metadata is read at load time, and the HTTP and Python chat surfaces
+add it to the stop tokens automatically. The user does not need to know the token id.
 
-### stop 문자열
+### stop strings
 
-OpenAI 호환 `stop`(문자열 하나 또는 배열)을 지원한다. 생성 텍스트에 stop 문자열이 나타나면
-그 직전까지만 반환하고 종료한다. 스트리밍에서는 stop 문자열 길이만큼 텍스트를 홀드백(hold-back)해서
-**청크 경계에 걸친 stop 문자열도 클라이언트로 새어 나가지 않는다.**
+The OpenAI-compatible `stop` (a single string or an array) is supported. When a stop string appears in the generated text,
+only the text up to just before it is returned and generation ends. In streaming, text is held back by the length of the
+stop string, so **a stop string that straddles a chunk boundary does not leak to the client either.**
 
-### 샘플링
+### Sampling
 
-- `temperature = 0.0` — 결정적 탐욕 선택 (회귀 시험용)
-- `temperature > 0` + `top_k` — 고정 시드(`seed`) 기반 확률 샘플링. 같은 시드는 같은 출력
-- 다중 바이트 문자(한글 등)가 토큰 경계에 걸치면 완성될 때까지 방출을 보류한다 — 깨진 문자가 스트림에 나가지 않는다
+- `temperature = 0.0`: deterministic greedy selection (for regression testing)
+- `temperature > 0` + `top_k`: probability sampling based on a fixed seed (`seed`). The same seed gives the same output
+- When a multi-byte character (such as Korean) straddles a token boundary, emission is deferred until it is complete, so a broken character never goes out on the stream
 
-### wgpu 프리필 GEMM 오프로드 (실험적, RASE_GPU=1 옵트인)
+### wgpu prefill GEMM offload (experimental, opt-in via RASE_GPU=1)
 
-프리필의 양자화 선형층(Q4_K)을 GPU 로 오프로드하는 실험 경로다. 양자화 가중치를
-행렬 단위로 GPU 에 상주시키고 WGSL 셰이더 안에서 역양자화하며 곱한다 (역양자화된
-f32 를 매 호출 복사하면 수 GB 라 손해이기 때문). 디코드는 메모리 대역폭 바운드라
-내장 GPU 이득이 없어 항상 CPU 에 남는다.
+An experimental path that offloads the quantized linear layer (Q4_K) of prefill to the GPU. It keeps the quantized weights
+resident on the GPU per matrix and dequantizes and multiplies inside a WGSL shader (copying the dequantized f32 on every
+call would be several GB, which is a loss). Decode is memory-bandwidth bound with no gain on an integrated GPU, so it always
+stays on the CPU.
 
-- **켜는 법**: `RASE_GPU=1` (기본 비활성). 현재 f32 셰이더는 통합 GPU 에서 CPU
-  하이브리드 GEMM 과 비슷한 속도라 기본값이 꺼져 있다. f16 셰이더 경로가 CPU 를
-  상회하면 기본 활성으로 바뀔 예정이다
-- **안전장치**: 소프트웨어 어댑터(WARP·llvmpipe 류, DeviceType Cpu)는 자동 제외 /
-  런타임 실패(디바이스 유실·매핑 실패) 시 그 즉시 전 과정이 CPU 경로로 복귀 /
-  Q4_K 외 dtype(Q6_K 등)과 GPU 부재 환경은 행렬 단위로 CPU 폴백
-- **진단**: Python `gpu_info()` 가 `active: <어댑터>` / `fallback(runtime-failure)` /
-  `inactive` 를 반환한다. 프로파일링 카운터 `gemm_gpu_ns`·`gemm_gpu_calls` 로
-  오프로드 몫을 계측한다 (위 성능 프로파일링 절)
-- **수치 특성**: GPU 역양자화 GEMM 은 연산 순서 차이로 CPU 와 비트 동일하지 않지만,
-  로짓 허용오차 내에서 일치한다 (같은 시드 greedy 디코드 출력 일치를 실측 확인)
+- **How to enable**: `RASE_GPU=1` (disabled by default). The current f32 shader runs about the same speed as the CPU
+  hybrid GEMM on an integrated GPU, so the default is off. It will switch to on by default once an f16 shader path
+  outperforms the CPU
+- **Safeguards**: software adapters (WARP, llvmpipe class, DeviceType Cpu) are excluded automatically / on a runtime
+  failure (device loss, mapping failure) the whole path falls back to the CPU immediately / dtypes other than Q4_K
+  (Q6_K and so on) and GPU-absent environments fall back to the CPU per matrix
+- **Diagnostics**: Python `gpu_info()` returns `active: <adapter>` / `fallback(runtime-failure)` /
+  `inactive`. The profiling counters `gemm_gpu_ns` and `gemm_gpu_calls` measure the offloaded share (see the performance
+  profiling section above)
+- **Numerical characteristics**: the GPU dequant GEMM is not bit-identical to the CPU because of the operation order, but
+  it matches within the logit tolerance (identical greedy-decode output under the same seed was confirmed by measurement)
 
-### 디코드 스레드 정책 (CANDLE_NUM_THREADS)
+### Decode thread policy (CANDLE_NUM_THREADS)
 
-디코드(토큰 생성)의 양자화 matvec 과 융합 어텐션은 `CANDLE_NUM_THREADS` 로 크기가 정해지는
-배리어 풀에서 정적 균등 분할로 돈다. 하이브리드 CPU(성능 코어 + 효율 코어 + 저전력 효율 코어
-혼합)에서는 매 배리어가 가장 느린 코어를 기다리게 되어, 코어를 전부 쓰는 기본값이 오히려
-디코드 처리량을 반토막 낸다 (16코어 Core Ultra 7 255H 실측: Qwen3-4B 디코드가 16스레드
-10 tok/s, 12스레드 20 tok/s. 절벽은 저전력 코어가 풀에 들어오는 지점에서 생긴다).
+The quantized matvec and fused attention of decode (token generation) run over a barrier pool sized by `CANDLE_NUM_THREADS`,
+with static even partitioning. On a hybrid CPU (a mix of performance cores, efficiency cores, and low-power efficiency
+cores), every barrier waits for the slowest core, so the default of using all cores actually halves decode throughput
+(measured on a 16-core Core Ultra 7 255H: Qwen3-4B decode at 16 threads 10 tok/s, 12 threads 20 tok/s. The cliff appears
+at the point where the low-power cores enter the pool).
 
-엔진은 첫 모델 로드 시 다음 기본값을 적용한다:
+The engine applies the following defaults on the first model load:
 
-- `CANDLE_NUM_THREADS` 가 이미 설정돼 있으면 그대로 존중한다 (기본값 미적용)
-- 미설정이고 물리 코어가 12개 이상이면 `물리 코어 - 4` 로 설정한다. 디코드는 메모리
-  대역폭 바운드라 코어 수 이하에서 포화하므로, 균질 다코어 CPU 에서 이 상한의 손실은 작고
-  하이브리드 CPU 에서는 낙오자 페널티가 사라진다
-- 물리 코어 12개 미만이면 손대지 않는다
+- If `CANDLE_NUM_THREADS` is already set, it is respected as is (the default is not applied)
+- If unset and there are 12 or more physical cores, it is set to `physical cores - 4`. Because decode is memory-bandwidth
+  bound and saturates below the core count, the loss from this cap is small on a homogeneous many-core CPU and the
+  straggler penalty disappears on a hybrid CPU
+- Below 12 physical cores it is left untouched
 
-프리필 경로(하이브리드 GEMM 의 f32 행렬곱, 블록형 어텐션)는 별도 rayon 풀
-(`RAYON_NUM_THREADS`, 기본 = 전체 물리 코어)을 쓰므로 이 정책의 영향을 받지 않는다.
-스레드 수는 작업 분할만 바꾸고 출력 원소별 계산 주체는 동일하므로, 같은 시드의 출력은
-스레드 수와 무관하게 같다.
+The prefill path (the f32 matmul of the hybrid GEMM, blocked attention) uses a separate rayon pool
+(`RAYON_NUM_THREADS`, default = all physical cores), so it is unaffected by this policy.
+Thread count only changes the work partition, and the per-output-element computation is the same, so output under the same
+seed is identical regardless of thread count.
 
 ---
 
-## 9. HTTP API (OpenAI 호환)
+## 9. HTTP API (OpenAI-compatible)
 
-`serve` 명령으로 기동한다. 기본 바인딩은 `127.0.0.1:8080` (로컬 전용 — 외부 노출은 사용자 책임).
+Start it with the `serve` command. The default binding is `127.0.0.1:8080` (local only; external exposure is the user's responsibility).
 
-| 경로 | 메서드 | 역할 |
+| Path | Method | Role |
 |---|---|---|
-| `/health` | GET | 프로세스 생존 확인 |
-| `/v1/models` | GET | 등록 모델 목록 (OpenAI list 형식) |
-| `/v1/models/{id}` | GET | 모델 존재 확인 |
-| `/v1/completions` | POST | 프롬프트 완성 (비스트리밍) |
-| `/v1/chat/completions` | POST | 채팅 완성 — `stream: true` 면 SSE 토큰 스트리밍 |
+| `/health` | GET | Process liveness check |
+| `/v1/models` | GET | List of registered models (OpenAI list format) |
+| `/v1/models/{id}` | GET | Check that a model exists |
+| `/v1/completions` | POST | Prompt completion (non-streaming) |
+| `/v1/chat/completions` | POST | Chat completion: SSE token streaming when `stream: true` |
 
-### 채팅 완성
+### Chat completion
 
 ```bash
 curl -s http://127.0.0.1:8080/v1/chat/completions \
@@ -477,13 +479,13 @@ curl -s http://127.0.0.1:8080/v1/chat/completions \
   }'
 ```
 
-응답은 OpenAI `chat.completion` 형식이다 — `choices[0].message.content`, `finish_reason`(`stop` | `length`), `usage` 토큰 집계.
+The response is in OpenAI `chat.completion` format: `choices[0].message.content`, `finish_reason` (`stop` | `length`), and a `usage` token count.
 
-### SSE 스트리밍
+### SSE streaming
 
-`"stream": true` 를 주면 `text/event-stream` 으로 OpenAI `chat.completion.chunk` 를 흘려보낸다.
-첫 청크는 role, 이후 청크는 `delta.content`, 마지막 청크는 `finish_reason`, 종료 표시는 `data: [DONE]`.
-클라이언트가 연결을 끊으면 서버는 다음 토큰 경계에서 디코딩을 중단한다 (낭비 계산 없음).
+With `"stream": true`, it streams OpenAI `chat.completion.chunk` as `text/event-stream`.
+The first chunk carries the role, later chunks carry `delta.content`, the last chunk carries `finish_reason`, and the terminator is `data: [DONE]`.
+If the client disconnects, the server stops decoding at the next token boundary (no wasted computation).
 
 ```bash
 curl -sN http://127.0.0.1:8080/v1/chat/completions \
@@ -491,58 +493,58 @@ curl -sN http://127.0.0.1:8080/v1/chat/completions \
   -d '{"model": "qwen3-4b", "messages": [{"role": "user", "content": "Count to 5."}], "stream": true}'
 ```
 
-### 요청 파라미터
+### Request parameters
 
-| 파라미터 | 타입 | 기본값 | 비고 |
+| Parameter | Type | Default | Notes |
 |---|---|---|---|
-| `model` | string | 필수 | 등록된 모델 id |
-| `messages` / `prompt` | array / string | 필수 | 채팅 / 완성 |
+| `model` | string | required | a registered model id |
+| `messages` / `prompt` | array / string | required | chat / completion |
 | `max_tokens` | int | 256 | |
-| `temperature` | float | 0.7 | 0.0 = 결정적 |
-| `top_k` | int | 40 | OpenAI 표준 외 확장 |
-| `seed` | int | 0 | 고정 시드 재현 |
-| `stop` | string 또는 array | 없음 | stop 문자열. 종료 토큰은 별도로 항상 적용 |
-| `stream` | bool | false | 채팅 완성만 지원 |
+| `temperature` | float | 0.7 | 0.0 = deterministic |
+| `top_k` | int | 40 | extension beyond the OpenAI standard |
+| `seed` | int | 0 | fixed-seed reproduction |
+| `stop` | string or array | none | stop string. The stop token is always applied separately |
+| `stream` | bool | false | chat completion only |
 
 ---
 
-## 10. CLI 도구
+## 10. CLI Tools
 
-바이너리명은 `rust-ai-serving-engine`, 모델 저장소는 `--store <폴더>` (기본 `.rust_ai_serving_engine`).
+The binary name is `rust-ai-serving-engine`, and the model store is `--store <folder>` (default `.rust_ai_serving_engine`).
 
-| 명령 | 인자 | 동작 |
+| Command | Arguments | Action |
 |---|---|---|
-| `model import` | `<path>` `--id` `[--kind]` `[--architecture]` `[--context-length]` `[--chat-template]` | 로컬 GGUF·Safetensors 를 해시와 함께 등록 |
-| `model pull` | `--repo --file --id` `[--architecture]` `[--chat-template]` `[--tokenizer-repo --tokenizer-file]` | Hugging Face 에서 받아 등록. 토크나이저 옵션을 주면 다운로드 후 자동 연결 |
-| `model attach-tokenizer` | `<id>` `--tokenizer <path>` | 등록 모델에 로컬 tokenizer.json 연결 |
-| `model list` | | 등록 모델 목록 |
-| `model inspect` | `<id>` | 매니페스트 TOML 출력 |
-| `model verify` | `<id>` | 가중치·토크나이저 해시 재검증 |
-| `runtime probe` | `[--device auto\|cpu\|cuda\|metal]` | 장치 선택 + 실제 텐서 연산 스모크 테스트 |
-| `serve` | `[--host]` `[--port]` `[--device]` | OpenAI 호환 API 서버 기동 |
+| `model import` | `<path>` `--id` `[--kind]` `[--architecture]` `[--context-length]` `[--chat-template]` | Register a local GGUF/Safetensors with its hash |
+| `model pull` | `--repo --file --id` `[--architecture]` `[--chat-template]` `[--tokenizer-repo --tokenizer-file]` | Download from Hugging Face and register. Given the tokenizer options, it downloads and links automatically |
+| `model attach-tokenizer` | `<id>` `--tokenizer <path>` | Link a local tokenizer.json to a registered model |
+| `model list` | | List registered models |
+| `model inspect` | `<id>` | Print the manifest TOML |
+| `model verify` | `<id>` | Re-verify the weight and tokenizer hashes |
+| `runtime probe` | `[--device auto\|cpu\|cuda\|metal]` | Device selection + a real tensor-op smoke test |
+| `serve` | `[--host]` `[--port]` `[--device]` | Start the OpenAI-compatible API server |
 
 ```bash
-# 로컬 파일 등록 후 무결성 검증
+# Register a local file then verify integrity
 rust-ai-serving-engine model import ./my-model.gguf --id my-model --architecture llama3
 rust-ai-serving-engine model verify my-model
 
-# 장치 확인
+# Check the device
 rust-ai-serving-engine runtime probe --device auto
 ```
 
 ---
 
-## 11. Python 바인딩 (PyO3)
+## 11. Python Binding (PyO3)
 
-**abi3(stable ABI)** 로 빌드되어 Python 3.9 이상 단일 휠로 호환된다. 모듈명은 `rust_ai_serving_engine`.
+Built with **abi3 (stable ABI)**, so it is compatible with Python 3.9 and up as a single wheel. The module name is `rust_ai_serving_engine`.
 
-### 설치
+### Installation
 
 ```bash
-# PyPI 게시 후 — Rust 툴체인 불필요
+# After publishing to PyPI: no Rust toolchain needed
 pip install rust_ai_serving_engine
 
-# 소스에서(최신 main / 게시 전) — 설치 머신에 Rust 툴체인 필요
+# From source (latest main / before publishing): the install machine needs a Rust toolchain
 pip install "git+https://github.com/arabangoo/rust_ai_serving_engine"
 ```
 
@@ -551,71 +553,71 @@ pip install "git+https://github.com/arabangoo/rust_ai_serving_engine"
 ```python
 import rust_ai_serving_engine as engine
 
-engine.__version__                                  # 예: "0.1.3"
-engine.probe_runtime(device="auto")                 # 장치 선택 + 텐서 스모크 테스트
+engine.__version__                                  # e.g. "0.1.6"
+engine.probe_runtime(device="auto")                 # device selection + tensor smoke test
 
-# 모델 수명주기 (store = 모델 저장소 폴더)
+# Model lifecycle (store = the model store folder)
 engine.pull_model(store, repo, file, id, kind="generator",
                   architecture=None, context_length=None, chat_template=None)
-engine.import_model(store, path, id, ...)           # 로컬 파일 등록 (인자 동일)
+engine.import_model(store, path, id, ...)           # register a local file (same arguments)
 engine.attach_tokenizer(store, id, tokenizer_path)
 engine.list_models(store)                           # ["qwen3-4b", ...]
-engine.inspect_model(store, id)                     # 매니페스트 TOML 문자열
-engine.verify_model(store, id)                      # 해시 재검증
-engine.unload_models()                              # 프로세스 캐시 전체 해제
+engine.inspect_model(store, id)                     # manifest TOML string
+engine.verify_model(store, id)                      # re-verify hashes
+engine.unload_models()                              # free the entire process cache
 
-# 생성 — 등록 모델 (프로세스 캐시 상주, 종료 토큰 자동)
+# Generation: registered model (resident in the process cache, stop token automatic)
 engine.generate_registered_gguf(store, id, prompt, max_tokens=256,
                                 temperature=0.7, top_k=40, seed=0,
                                 stop_tokens=[], device="auto")
 
-# 채팅 생성 — 템플릿 자동 적용
+# Chat generation: template applied automatically
 engine.generate_chat_registered_gguf(store, id,
     [{"role": "user", "content": "..."}], max_tokens=256, ...)
 
-# 채팅 스트리밍 — 텍스트 조각마다 콜백 호출. 콜백이 False 를 반환하면 중단되고
-# 그때까지의 부분 텍스트가 반환된다 (None 등 다른 반환값은 계속 진행).
+# Chat streaming: the callback is called per text fragment. If it returns False, generation
+# stops and the partial text so far is returned (other return values such as None continue).
 engine.generate_chat_stream_registered_gguf(store, id, messages, on_delta,
                                             max_tokens=256, ...)
 
-# 생성 — 파일 직접 지정 (레지스트리 없이 1회성)
+# Generation: direct file specification (one-off, without the registry)
 engine.generate_llama_gguf(weights_path, tokenizer_path, prompt, ...)
 
-# 성능 프로파일링 — 포워드 패스 구간 카운터 (아래 "성능 프로파일링" 절)
-engine.profiling_snapshot(reset=True)               # JSON 문자열
+# Performance profiling: forward-pass phase counters (see the "Performance profiling" section below)
+engine.profiling_snapshot(reset=True)               # JSON string
 
-# wgpu 프리필 오프로드 상태 (8장 wgpu 절) — "active: <어댑터>" | "inactive"
+# wgpu prefill offload status (section 8 wgpu): "active: <adapter>" | "inactive"
 engine.gpu_info()
 ```
 
-### 성능 프로파일링 (RASE_PROFILE)
+### Performance profiling (RASE_PROFILE)
 
-포워드 패스의 구간별 소요 시간을 나노초 카운터로 집계하는 진단 표면이다.
-프리필을 "양자화 선형 GEMM 작업"과 "어텐션 커널 작업"으로, 디코드를 "양자화 matvec"과
-"융합 어텐션"으로 분해해, 커널 최적화나 GPU 오프로드의 이득 상한을 코드 작성 전에
-수치로 판단할 수 있게 한다.
+A diagnostic surface that aggregates the per-phase time of the forward pass in nanosecond counters.
+It decomposes prefill into "quantized linear GEMM work" and "attention kernel work", and decode into "quantized matvec"
+and "fused attention", so you can judge numerically, before writing any code, the upper bound of what kernel optimization
+or GPU offload would gain.
 
-- **켜는 법**: 프로세스 시작 전에 환경변수 `RASE_PROFILE=1`. 프로세스당 1회만 읽으므로
-  실행 중 변경은 무효다. 꺼져 있으면(기본) 타이머를 아예 잡지 않아 추론 경로 비용이 0이고,
-  계측은 출력에 영향을 주지 않는다 (같은 시드는 켜고 꺼도 같은 출력).
-- **읽는 법**: `profiling_snapshot(reset=True)` 가 카운터 전체를 JSON 문자열로 반환한다.
-  `reset=True` 는 읽은 뒤 0으로 초기화하므로 연속 호출 사이가 곧 측정 창이 된다.
-- **적용 범위**: Qwen3 GGUF 디코더의 CPU 경로. 다른 디코더·장치에서는 카운터가 0에 머문다.
+- **How to enable**: set the environment variable `RASE_PROFILE=1` before the process starts. It is read only once per
+  process, so changing it during a run has no effect. When off (the default) it does not even set up the timers, so the
+  inference path cost is zero, and measurement does not affect output (the same seed gives the same output whether on or off).
+- **How to read**: `profiling_snapshot(reset=True)` returns all counters as a JSON string.
+  `reset=True` zeroes them after reading, so the gap between successive calls is the measurement window.
+- **Scope**: the CPU path of the Qwen3 GGUF decoder. On other decoders and devices the counters stay at 0.
 
-| 카운터 | 의미 |
+| Counter | Meaning |
 |---|---|
-| `prefill_calls` / `prefill_tokens` | 시퀀스 길이 2 이상 forward 호출 수 / 처리한 프롬프트 토큰 수 |
-| `prefill_forward_ns` | 프리필 forward 전체 벽시계 (임베딩부터 logits 까지) |
-| `gemm_dequant_ns` / `gemm_matmul_ns` | 하이브리드 GEMM 경로의 역양자화 / f32 행렬곱 시간 |
-| `attn_blocked_ns` / `attn_flash_ns` | 프리필 어텐션 커널 시간 (블록형 / candle flash) |
-| `decode_steps` / `decode_forward_ns` | 단일 토큰 forward 수 / 벽시계 (디코드 tok/s 계산용) |
-| `decode_matvec_ns` / `decode_attn_ns` | 디코드의 양자화 matvec / 융합 어텐션 시간 |
+| `prefill_calls` / `prefill_tokens` | number of forward calls with sequence length 2 or more / number of prompt tokens processed |
+| `prefill_forward_ns` | total wall-clock of prefill forward (from embedding to logits) |
+| `gemm_dequant_ns` / `gemm_matmul_ns` | dequant / f32 matmul time of the hybrid GEMM path |
+| `attn_blocked_ns` / `attn_flash_ns` | prefill attention kernel time (blocked / candle flash) |
+| `decode_steps` / `decode_forward_ns` | number of single-token forwards / wall-clock (for computing decode tok/s) |
+| `decode_matvec_ns` / `decode_attn_ns` | decode quantized matvec / fused attention time |
 
 ```python
 import json
 import os
 
-os.environ["RASE_PROFILE"] = "1"      # 반드시 첫 추론 전에
+os.environ["RASE_PROFILE"] = "1"      # must be before the first inference
 import rust_ai_serving_engine as engine
 
 engine.generate_chat_registered_gguf("./models", "qwen3-4b", [...], max_tokens=256)
@@ -627,20 +629,21 @@ print(f"prefill {prefill:.1f}s = GEMM {gemm:.1f}s + attention {attn:.1f}s + etc"
 print(f"decode {p['decode_steps'] / (p['decode_forward_ns'] / 1e9):.1f} tok/s")
 ```
 
-주의: `decode_matvec_ns` 는 시퀀스 길이 1 선형 호출 전체를 세므로, 프리필 마지막의
-lm_head 호출(호출당 1회)도 포함된다. 디코드가 수백 토큰이면 오차는 1% 미만이다.
+Note: `decode_matvec_ns` counts all sequence-length-1 linear calls, so it also includes the last prefill lm_head call
+(once per call). If decode is several hundred tokens, the error is under 1%.
 
-### 스트리밍 통합 레시피
+### Streaming integration recipe
 
-콜백이 원시 API 다. 서버 전송 이벤트(SSE)나 제너레이터가 필요하면 스레드 + 큐로 감싼다 —
-생성 루프는 GIL 을 해제한 채 돌고 콜백 호출 순간에만 GIL 을 잡으므로, 호스트 서비스와 자연스럽게 병행된다.
+The callback is the raw API. If you need server-sent events (SSE) or a generator, wrap it with a thread and a queue:
+the generation loop runs with the GIL released and grabs the GIL only at the moment of the callback, so it runs
+naturally alongside the host service.
 
 ```python
 import queue
 import threading
 
 def stream_chat(messages):
-    """토큰 조각을 순서대로 내놓는 제너레이터 (FastAPI StreamingResponse 등에 직결)."""
+    """A generator that yields token fragments in order (wires straight into FastAPI StreamingResponse etc.)."""
     q: queue.Queue = queue.Queue()
     done = object()
 
@@ -658,33 +661,33 @@ def stream_chat(messages):
         yield item
 ```
 
-### 호스트 서비스를 멈추지 않는다 — GIL 해제
+### It does not stall the host service: GIL released
 
-다운로드·해시 검증·모델 로드·토큰 생성 같은 장시간 작업은 모두 **GIL(Global Interpreter Lock)을
-해제한 채** Rust 에서 수행된다. FastAPI·Flask 같은 호스트 서비스에 임베드해도 생성 중에
-다른 요청 스레드가 멈추지 않는다 (생성 중 파이썬 하트비트 스레드가 정상 동작함을 실측 확인).
+Long-running work such as download, hash verification, model load, and token generation all runs in Rust
+**with the GIL (Global Interpreter Lock) released**. Even embedded in a host service such as FastAPI or Flask, other
+request threads do not stall during generation (a Python heartbeat thread was confirmed to run normally during generation).
 
-### 캐시 동작
+### Cache behavior
 
-등록 모델 생성 함수의 최초 호출이 해시 검증 + 로드를 수행하고, 이후 호출은 메모리 상주 모델을
-재사용한다. 매니페스트의 해시가 바뀌면(모델 파일 교체) 자동으로 재검증·재로드된다.
-메모리를 돌려받으려면 `unload_models()` 를 부른다.
+The first call of a registered-model generation function performs hash verification and load, and later calls reuse the
+memory-resident model. If the manifest hash changes (the model file was replaced), it re-verifies and reloads automatically.
+To reclaim memory, call `unload_models()`.
 
 ---
 
-## 12. 서비스 파이프라인에 붙이기
+## 12. Embedding into a Service Pipeline
 
-이 엔진은 단독 앱이 아니라 **로컬 추론이 필요한 자리에 박아 넣는 코어 의존성**이다.
-호스트 환경에 따라 아래 표면 중 하나를 고른다.
+This engine is not a standalone app but a **core dependency you embed wherever local inference is needed**.
+Pick one of the surfaces below according to the host environment.
 
-| 호스트 | 표면 | 통합 방법 |
+| Host | Surface | Integration method |
 |---|---|---|
-| 기존 OpenAI 클라이언트 코드 | HTTP 서버 | `base_url` 만 로컬로 변경 |
-| Python 서비스 (FastAPI 등) | Python 모듈 | 서버 없이 in-process 추론 |
-| Rust 서비스 | crate | 레지스트리 + 세션 캐시 직접 사용 |
-| 타 언어 / 배치 / 오케스트레이션 | CLI + HTTP | `serve` 를 사이드카로 |
+| Existing OpenAI client code | HTTP server | Just change `base_url` to local |
+| Python service (FastAPI etc.) | Python module | In-process inference with no server |
+| Rust service | crate | Use the registry + session cache directly |
+| Other languages / batch / orchestration | CLI + HTTP | `serve` as a sidecar |
 
-### 12.1 OpenAI SDK — base_url 교체 한 줄
+### 12.1 OpenAI SDK: a one-line base_url swap
 
 ```python
 from openai import OpenAI
@@ -692,19 +695,19 @@ from openai import OpenAI
 client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="unused")
 out = client.chat.completions.create(
     model="qwen3-4b",
-    messages=[{"role": "user", "content": "요약해줘: ..."}],
+    messages=[{"role": "user", "content": "Summarize this: ..."}],
     stream=True,
 )
 for chunk in out:
     print(chunk.choices[0].delta.content or "", end="")
 ```
 
-LangChain 도 같은 방식이다 — `ChatOpenAI(base_url="http://127.0.0.1:8080/v1", model="qwen3-4b")`.
+LangChain is the same way: `ChatOpenAI(base_url="http://127.0.0.1:8080/v1", model="qwen3-4b")`.
 
-### 12.2 Python 서비스에 in-process 임베드
+### 12.2 In-process embedding into a Python service
 
-서버 프로세스를 따로 두지 않고 서비스 안에서 직접 추론한다. GIL 이 해제되므로
-이벤트 루프는 `run_in_executor`(또는 FastAPI 의 스레드풀)로 감싸면 된다.
+Run inference directly inside the service without a separate server process. Because the GIL is released,
+wrap it with the event loop's `run_in_executor` (or FastAPI's thread pool).
 
 ```python
 import asyncio
@@ -720,20 +723,20 @@ async def answer(messages: list[dict]) -> str:
     )
 ```
 
-### 12.3 Rust 서비스에 임베드
+### 12.3 Embedding into a Rust service
 
-생성은 동기·CPU 바운드이므로 async 서버(axum 등)에서는 `spawn_blocking` 으로 감싼다.
-`SessionCache` 를 `Arc` 로 공유하면 모델은 프로세스에서 한 번만 로드된다.
+Generation is synchronous and CPU bound, so in an async server (axum etc.) wrap it with `spawn_blocking`.
+Sharing `SessionCache` via `Arc` loads the model only once in the process.
 
 ```rust
 use std::sync::Arc;
 use rust_ai_serving_engine_core::{DevicePreference, GenerationConfig, ModelRegistry, generate};
 use rust_ai_serving_engine_models::SessionCache;
 
-// 기동 시 1회
+// Once at startup
 let cache = Arc::new(SessionCache::new());
 
-// 핸들러
+// Handler
 let cache = cache.clone();
 let text = tokio::task::spawn_blocking(move || -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let registry = ModelRegistry::open("./models")?;
@@ -747,21 +750,21 @@ let text = tokio::task::spawn_blocking(move || -> Result<String, Box<dyn std::er
 }).await??;
 ```
 
-기성 HTTP 표면이 필요하면 `rust_ai_serving_engine_api::{router, serve, ApiState}` 를 그대로
-자기 서버에 합성할 수도 있다.
+If you need a ready-made HTTP surface, you can also compose `rust_ai_serving_engine_api::{router, serve, ApiState}`
+straight into your own server.
 
-### 12.4 타 언어 / 배치 — 사이드카
+### 12.4 Other languages / batch: sidecar
 
-Java·Node·Go 등에서는 `serve` 를 사이드카 프로세스로 띄우고 OpenAI 클라이언트로 붙는 것이
-가장 단순하다. 단일 바이너리라 컨테이너에 실행 파일 하나 + 모델 폴더만 넣으면 된다.
+In Java, Node, Go, and so on, the simplest approach is to run `serve` as a sidecar process and connect with an OpenAI client.
+Being a single binary, you only need to put one executable + a model folder into the container.
 
 ---
 
-## 13. 새 모델 아키텍처 추가하기
+## 13. Adding a New Model Architecture
 
-새 GGUF 아키텍처는 세 단계로 붙는다. 코어 생성 루프·API·CLI 는 건드리지 않는다.
+A new GGUF architecture attaches in three steps. You do not touch the core generation loop, the API, or the CLI.
 
-1. **디코더 구현** — `TokenDecoder` 를 구현한다. Candle 의 quantized 모델 구현을 감싸는 것이 기본형이다.
+1. **Implement the decoder**: implement `TokenDecoder`. Wrapping Candle's quantized model implementation is the basic form.
 
 ```rust
 use rust_ai_serving_engine_core::{Result, TokenDecoder};
@@ -770,106 +773,106 @@ pub struct MyArchDecoder { /* ModelWeights + device + position */ }
 
 impl TokenDecoder for MyArchDecoder {
     fn prefill(&mut self, prompt: &[u32]) -> Result<Vec<f32>> {
-        // KV 캐시 초기화 → 프롬프트 전체 forward → 마지막 위치 logits (rank-1 Vec<f32>)
+        // init the KV cache -> forward the whole prompt -> logits at the last position (rank-1 Vec<f32>)
     }
     fn decode(&mut self, token: u32) -> Result<Vec<f32>> {
-        // 토큰 1개 forward (KV 캐시 누적) → 다음 logits
+        // forward one token (accumulate the KV cache) -> next logits
     }
-    fn eos_token(&self) -> Option<u32> { /* GGUF 메타데이터에서 읽은 값 */ }
+    fn eos_token(&self) -> Option<u32> { /* the value read from the GGUF metadata */ }
 }
 ```
 
-2. **아키텍처 매핑 등록** — `load_gguf_decoder` 의 match 에 아키텍처 이름을 추가한다.
-   지원하지 않는 조합은 잘못된 출력 대신 `UnsupportedArchitecture` 로 거절하는 것이 규약이다.
+2. **Register the architecture mapping**: add the architecture name to the match in `load_gguf_decoder`.
+   The convention is to refuse an unsupported combination with `UnsupportedArchitecture` instead of producing wrong output.
 
-3. **채팅 템플릿 연결** — 기존 3종으로 충분하면 `ChatTemplate::for_architecture` 에 기본값만 추가하고,
-   새 마크업이 필요하면 variant 와 렌더 함수를 추가한다 (렌더는 순수 함수라 단위 테스트로 고정한다).
+3. **Wire the chat template**: if the existing three are enough, add only a default to `ChatTemplate::for_architecture`,
+   and if new markup is needed, add a variant and a render function (rendering is a pure function, so it is pinned by unit tests).
 
-주의할 계약 두 가지 — `prefill` 은 반드시 KV 캐시를 초기화해야 하고(이전 대화 오염 방지),
-logits 는 **rank-1 벡터**로 반환해야 한다 (Candle forward 가 `(batch, vocab)` rank-2 를 주면 squeeze 필요 —
-실제로 이 처리 누락이 치명 버그였고 실모델 종단 간 시험으로 잡았다).
+Two contracts to watch: `prefill` must initialize the KV cache (to prevent contamination from the previous conversation),
+and logits must be returned as a **rank-1 vector** (if Candle forward gives `(batch, vocab)` rank-2, a squeeze is needed;
+this missing step was in fact a fatal bug, caught by a real-model end-to-end test).
 
 ---
 
-## 14. 빌드 · Feature 조합 · 테스트
+## 14. Build, Features, and Tests
 
-이 저장소를 clone 한 경우, **Rust 툴체인(stable)** 으로 한 번 빌드해야 한다.
+If you clone this repository, you must build it once with a **Rust toolchain (stable)**.
 
-| 쓰는 방식 | 빌드 명령 | 결과물 |
+| Usage | Build command | Output |
 |---|---|---|
-| CLI + 서버 | `cargo build --release` | `target/release/rust-ai-serving-engine` 단일 바이너리 |
-| Python 모듈 | `pip install maturin && maturin develop --release` | 현재 venv 에 `import rust_ai_serving_engine` |
-| Rust 라이브러리 | `Cargo.toml` 에 `git`/`path` 의존성 | 다른 Rust 프로젝트에 링크 |
+| CLI + server | `cargo build --release` | `target/release/rust-ai-serving-engine` single binary |
+| Python module | `pip install maturin && maturin develop --release` | `import rust_ai_serving_engine` in the current venv |
+| Rust library | a `git`/`path` dependency in `Cargo.toml` | linked into another Rust project |
 
 ```bash
-# 전체 워크스페이스 빌드·테스트
+# Build and test the whole workspace
 cargo build --release
 cargo test --workspace
 cargo clippy --all-targets
 
-# Python 확장 게이트 컴파일 확인
+# Confirm the Python extension gate compiles
 cargo check -p rust-ai-serving-engine-python --features python
 
-# 배포 휠 빌드
-maturin build --release          # dist/ 에 abi3 휠
+# Build the distribution wheel
+maturin build --release          # abi3 wheel in dist/
 ```
 
-테스트는 모델 파일 없이 동작하는 범위를 결정적으로 검증한다 — 생성 루프(정지·취소), 레지스트리
-(등록·해시 변조 감지·토크나이저 연결), 채팅 템플릿 렌더 3종, stop 문자열 파싱·홀드백 경계.
+The tests deterministically verify the range that works without a model file: the generation loop (stop, cancel), the registry
+(registration, hash-tamper detection, tokenizer linking), the three chat-template renders, and stop-string parsing and hold-back boundaries.
 
-### 실모델 스모크 (수동)
+### Real-model smoke (manual)
 
-코드 변경 후 실모델 회귀는 [2장](#2-빠른-시작)의 CLI 흐름 그대로 — 소형 GGUF 를 pull 해
-`serve` 를 띄우고 채팅 완성(비스트리밍·스트리밍)을 호출한다. `temperature: 0.0` + 고정 `seed` 로
-같은 입력의 출력 안정성까지 확인한다.
+After a code change, a real-model regression follows the CLI flow of [Section 2](#2-quick-start) exactly: pull a small GGUF,
+start `serve`, and call chat completion (non-streaming and streaming). With `temperature: 0.0` + a fixed `seed`, also confirm
+output stability for the same input.
 
 ---
 
-## 15. 디렉토리 구조
+## 15. Directory Structure
 
 ```text
 rust_ai_serving_engine/
-  Cargo.toml                              # 워크스페이스 정의
-  pyproject.toml                          # maturin 빌드 메타데이터 (PyPI 패키지)
-  README.md                               # 이 문서
+  Cargo.toml                              # workspace definition
+  pyproject.toml                          # maturin build metadata (PyPI package)
+  README.md                               # this document
   crates/
     rust_ai_serving_engine_core/
       src/
-        lib.rs                            # 크레이트 루트 · re-export
+        lib.rs                            # crate root, re-exports
         manifest.rs                       # ModelManifest / ModelKind / ModelFormat
-        registry.rs                       # ModelRegistry (등록·해시·검증, 원자적 기록)
-        generation.rs                     # TokenDecoder / GenerationConfig / generate(_with) / 샘플러
-        runtime.rs                        # DevicePreference / RuntimeDevice (CPU·CUDA·Metal)
-        hub.rs                            # HuggingFaceHub 다운로드
+        registry.rs                       # ModelRegistry (register, hash, verify, atomic write)
+        generation.rs                     # TokenDecoder / GenerationConfig / generate(_with) / sampler
+        runtime.rs                        # DevicePreference / RuntimeDevice (CPU, CUDA, Metal)
+        hub.rs                            # HuggingFaceHub download
         error.rs                          # EngineError
     rust_ai_serving_engine_models/
       src/
-        lib.rs                            # load_gguf_decoder · GGUF EOS 추출
-        llama_gguf.rs                     # Llama·Mistral GGUF 디코더
-        qwen3_gguf.rs                     # Qwen3 GGUF 디코더
-        qwen3_model.rs                    # Qwen3 forward (하이브리드 프리필 GEMM + 블록 어텐션)
-        profiling.rs                      # RASE_PROFILE 구간 카운터 (11장 성능 프로파일링)
-        threading.rs                      # 디코드 스레드 기본 정책 (8장 디코드 스레드 정책)
-        gpu_gemm.rs                       # wgpu 프리필 GEMM 오프로드 (8장, RASE_GPU=1 옵트인)
-        chat.rs                           # ChatTemplate (ChatML·Llama3·Mistral) + 렌더 테스트
+        lib.rs                            # load_gguf_decoder, GGUF EOS extraction
+        llama_gguf.rs                     # Llama/Mistral GGUF decoder
+        qwen3_gguf.rs                     # Qwen3 GGUF decoder
+        qwen3_model.rs                    # Qwen3 forward (hybrid prefill GEMM + blocked attention)
+        profiling.rs                      # RASE_PROFILE phase counters (section 11 performance profiling)
+        threading.rs                      # decode thread default policy (section 8 decode thread policy)
+        gpu_gemm.rs                       # wgpu prefill GEMM offload (section 8, opt-in via RASE_GPU=1)
+        chat.rs                           # ChatTemplate (ChatML, Llama3, Mistral) + render tests
         session.rs                        # ModelSession / SessionCache
         tokenizer.rs                      # LocalTokenizer (tokenizer.json)
     rust_ai_serving_engine_api/
-      src/lib.rs                          # OpenAI 호환 HTTP API + SSE 스트리밍
+      src/lib.rs                          # OpenAI-compatible HTTP API + SSE streaming
     rust_ai_serving_engine_cli/
-      src/main.rs                         # model / runtime / serve 명령
+      src/main.rs                         # model / runtime / serve commands
     rust_ai_serving_engine_python/
       src/
-        lib.rs                            # feature 게이트
-        python.rs                         # PyO3 바인딩 (GIL 해제 + 프로세스 세션 캐시)
+        lib.rs                            # feature gate
+        python.rs                         # PyO3 binding (GIL released + process session cache)
 ```
 
 ---
 
-## 16. 라이선스와 모델 책임
+## 16. License and Model Responsibility
 
-엔진 코드는 Apache-2.0 이다.
+The engine code is Apache-2.0.
 
-모델 가중치·토크나이저·GGUF 변환물의 라이선스는 엔진과 별개다. 레지스트리에 등록하는 각 모델의
-출처와 라이선스 조건(재배포 가능 여부 포함)은 사용자가 확인해야 하며, 상업 배포에서는 모델별 조건을
-확인한 뒤에만 번들에 포함한다.
+The licenses of the model weights, tokenizer, and GGUF conversions are separate from the engine. For each model registered in
+the registry, the user must confirm the source and license terms (including whether redistribution is allowed), and for
+commercial distribution include it in a bundle only after confirming the per-model terms.
