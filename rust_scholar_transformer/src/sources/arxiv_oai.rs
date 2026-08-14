@@ -1,9 +1,23 @@
-//! arXiv OAI-PMH 어댑터 — 설계상 1순위 경로. 라이브 검색 API 와 달리 rate-limit 노출이 없어
-//! 공유 IP 차단(HTTP 429) 문제를 피한다. OAI-PMH 는 키워드 검색이 아니라 날짜 기반 수확이므로,
-//! 최근 N일 레코드를 ListRecords 로 가져와(`from=`) 메모리에서 키워드 필터링한다.
+//! arXiv OAI-PMH 어댑터 — **최근 구간 모니터링 전용 경로다(0.2.0 부터 보조).**
 //!
-//! 한계(정직히): 한 번에 첫 페이지만 가져온다(resumptionToken 페이지네이션 미추적). 대규모
-//! 키워드 검색은 여러 페이지를 로컬 인덱스로 수확해야 하며, 그 인덱스 레이어는 후속 작업이다.
+//! OAI-PMH 는 키워드 검색 프로토콜이 아니라 **날짜 기반 수확**이다. 최근 N일 레코드를
+//! ListRecords 로 가져와(`from=`) 메모리에서 필터링하므로, 그 창 밖의 논문은 원리적으로
+//! 찾을 수 없다. 0.1.x 는 이 경로를 1순위로 뒀고 그 결과 일반 검색의 재현율이 사실상 0 이었다
+//! (2026-08-14 실측: 음성 인식 질의에 관련 논문 0건). 전체 아카이브 검색은
+//! [`super::arxiv::ArxivSource`] 가 맡고, 이 경로는 다음 두 경우에만 쓴다.
+//!
+//! - 최근 N일에 올라온 것을 **분야 단위로 전량** 훑을 때(`set` 지정)
+//! - 라이브 API 가 막혔을 때의 폴백
+//!
+//! 0.2.0 의 수정 셋.
+//! 1. 키워드 필터를 OR 에서 **AND** 로 바꿨다. 0.1.x 는 낱말 하나만 걸려도 통과시켜
+//!    `zzzqqq nonexistent gibberish term` 같은 무의미 질의에도 결과를 냈다("term" 이 걸렸다).
+//! 2. 두 글자 이하 토큰은 필터에서 제외한다(관사·전치사가 전부 통과시키는 것을 막는다).
+//! 3. resumptionToken 페이지네이션을 추적한다(`max_pages` 상한). 0.1.x 는 첫 페이지만 봤다.
+//!
+//! 남은 한계(정직히): `from` 은 arXiv 의 **datestamp(메타데이터 갱신일)** 기준이라, 오래전
+//! 논문이 메타데이터만 갱신돼도 최근 수확에 섞인다. 반환되는 `published_at` 은 원 제출일이므로
+//! 날짜가 흩어져 보이는 것은 이 때문이다. 제출일 기준 정렬이 필요하면 라이브 API 를 쓴다.
 
 use chrono::{Duration as ChronoDuration, Utc};
 use quick_xml::events::Event;
@@ -16,7 +30,10 @@ use crate::source::{RatePolicy, Source};
 
 const DEFAULT_BASE_URL: &str = "https://oaipmh.arxiv.org/oai";
 const OAI_USER_AGENT: &str =
-    "rust_scholar_transformer/0.1 (+https://github.com/arabangoo/rust_scholar_transformer)";
+    "rust_scholar_transformer/0.2 (+https://github.com/arabangoo/rust_scholar_transformer)";
+/// 필터에 쓸 토큰의 최소 길이. "a", "of", "in" 이 AND 조건에 들어가면 정밀도가 아니라
+/// 잡음이 된다(초록 어디에나 있다).
+const MIN_TERM_LEN: usize = 3;
 
 /// arXiv OAI-PMH 수확 어댑터.
 pub struct ArxivOaiSource {
@@ -24,9 +41,16 @@ pub struct ArxivOaiSource {
     base_url: String,
     /// 최근 며칠치 레코드를 수확할지(ListRecords `from=`).
     from_days: i64,
-    /// OAI set 한정(예: "cs"). None 이면 전체.
+    /// OAI set 한정(예: "cs"). None 이면 전체 분야를 수확한다 — arXiv 는 수학·물리 비중이
+    /// 압도적이라, 전산·전기 논문을 찾는다면 반드시 지정해야 밀도가 나온다.
     set: Option<String>,
     language: Option<String>,
+    /// resumptionToken 을 따라갈 최대 페이지 수. 수확량과 소요 시간의 상한을 함께 정한다.
+    ///
+    /// 기본은 1 이다. 한 페이지가 약 3.6MB / 1300건이라 페이지를 늘리면 엔진 기본 타임아웃
+    /// (10초)을 쉽게 넘긴다(실측: 3페이지 8.5초, 조건에 따라 초과). 더 넓게 훑으려면 이 값과
+    /// 엔진 타임아웃을 함께 올린다.
+    max_pages: usize,
 }
 
 impl ArxivOaiSource {
@@ -37,7 +61,15 @@ impl ArxivOaiSource {
             from_days: 7,
             set: None,
             language: Some("en".to_string()),
+            max_pages: 1,
         }
+    }
+
+    /// resumptionToken 을 따라갈 최대 페이지 수(기본 1). 올릴 때는 엔진 타임아웃도 함께 올린다
+    /// ([`crate::Engine::with_timeout`]). 페이지당 약 3.6MB / 1300건이다.
+    pub fn with_max_pages(mut self, pages: usize) -> Self {
+        self.max_pages = pages.max(1);
+        self
     }
 
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
@@ -53,6 +85,23 @@ impl ArxivOaiSource {
     pub fn with_set(mut self, set: impl Into<String>) -> Self {
         self.set = Some(set.into());
         self
+    }
+
+    /// 한 페이지를 가져온다. status 를 본문 파싱 전에 먼저 확인한다(오류 페이지 HTML 을
+    /// XML 로 잘못 파싱하지 않도록).
+    async fn fetch(&self, params: &[(&str, &str)]) -> Result<String, FetchError> {
+        let resp = self
+            .client
+            .get(&self.base_url)
+            .header(reqwest::header::USER_AGENT, OAI_USER_AGENT)
+            .query(params)
+            .send()
+            .await
+            .map_err(|e| FetchError::Http(e.to_string()))?;
+        if !resp.status().is_success() {
+            return Err(FetchError::Http(format!("arXiv OAI HTTP {}", resp.status().as_u16())));
+        }
+        resp.text().await.map_err(|e| FetchError::Http(e.to_string()))
     }
 }
 
@@ -72,43 +121,59 @@ impl Source for ArxivOaiSource {
         let from = (Utc::now() - ChronoDuration::days(self.from_days.max(0)))
             .format("%Y-%m-%d")
             .to_string();
-        let mut params: Vec<(&str, &str)> = vec![
-            ("verb", "ListRecords"),
-            ("metadataPrefix", "oai_dc"),
-            ("from", from.as_str()),
-        ];
-        if let Some(set) = &self.set {
-            params.push(("set", set.as_str()));
+
+        // resumptionToken 을 따라가며 최대 max_pages 만큼 수확한다.
+        let mut records = Vec::new();
+        let mut token: Option<String> = None;
+        for page in 0..self.max_pages {
+            let xml = match &token {
+                // OAI 규격상 resumptionToken 은 verb 외의 인자와 함께 보낼 수 없다.
+                Some(t) => self.fetch(&[("verb", "ListRecords"), ("resumptionToken", t.as_str())]).await?,
+                None => {
+                    let mut params: Vec<(&str, &str)> = vec![
+                        ("verb", "ListRecords"),
+                        ("metadataPrefix", "oai_dc"),
+                        ("from", from.as_str()),
+                    ];
+                    if let Some(set) = &self.set {
+                        params.push(("set", set.as_str()));
+                    }
+                    self.fetch(&params).await?
+                }
+            };
+
+            let (recs, next) = parse_oai(&xml)?;
+            records.extend(recs);
+
+            match next {
+                Some(t) if !t.trim().is_empty() && page + 1 < self.max_pages => token = Some(t),
+                _ => break,
+            }
         }
 
-        let resp = self
-            .client
-            .get(&self.base_url)
-            .header(reqwest::header::USER_AGENT, OAI_USER_AGENT)
-            .query(&params)
-            .send()
-            .await
-            .map_err(|e| FetchError::Http(e.to_string()))?;
-        if !resp.status().is_success() {
-            return Err(FetchError::Http(format!("arXiv OAI HTTP {}", resp.status().as_u16())));
-        }
-        let xml = resp.text().await.map_err(|e| FetchError::Http(e.to_string()))?;
-
-        let records = parse_oai(&xml)?;
-        let terms: Vec<String> =
-            query.text.split_whitespace().map(|w| w.to_lowercase()).collect();
+        // AND 매칭. 두 글자 이하 토큰은 제외한다 — 관사·전치사 하나가 전량을 통과시키기 때문이다.
+        let terms: Vec<String> = query
+            .text
+            .split_whitespace()
+            .map(|w| {
+                w.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase()
+            })
+            .filter(|w| w.chars().count() >= MIN_TERM_LEN)
+            .collect();
 
         let mut docs = Vec::new();
         for r in records {
-            let title = normalize_title(&r.title);
-            let summary = if r.description.is_empty() { None } else { Some(strip_html(&r.description)) };
-
+            // 정규화(strip_html 등)는 필터를 통과한 레코드에만 한다. 한 페이지가 1300건이라
+            // 전량을 먼저 정규화하면 그 비용이 통째로 버려지고 엔진 타임아웃을 넘긴다.
             if !terms.is_empty() {
-                let hay = format!("{} {}", title, summary.clone().unwrap_or_default()).to_lowercase();
-                if !terms.iter().any(|t| hay.contains(t.as_str())) {
+                let raw = format!("{} {}", r.title, r.description).to_lowercase();
+                if !terms.iter().all(|t| raw.contains(t.as_str())) {
                     continue;
                 }
             }
+
+            let title = normalize_title(&r.title);
+            let summary = if r.description.is_empty() { None } else { Some(strip_html(&r.description)) };
 
             let arxiv_id = arxiv_id_from_url(&r.identifier);
             docs.push(Document {
@@ -152,10 +217,12 @@ struct OaiRecord {
 }
 
 /// 네임스페이스 프리픽스에 견고하도록 quick-xml 이벤트를 직접 순회해 로컬 이름으로 필드를 잡는다.
-fn parse_oai(xml: &str) -> Result<Vec<OaiRecord>, FetchError> {
+/// 반환값의 두 번째 항목은 다음 페이지용 resumptionToken 이다(없거나 비었으면 마지막 페이지).
+fn parse_oai(xml: &str) -> Result<(Vec<OaiRecord>, Option<String>), FetchError> {
     let mut reader = Reader::from_str(xml);
     let mut records = Vec::new();
     let mut cur: Option<OaiRecord> = None;
+    let mut resumption: Option<String> = None;
     let mut text = String::new();
 
     loop {
@@ -188,6 +255,13 @@ fn parse_oai(xml: &str) -> Result<Vec<OaiRecord>, FetchError> {
                         _ => {}
                     }
                 }
+                // resumptionToken 은 record 바깥(ListRecords 직계)에 온다.
+                if local == "resumptionToken" && cur.is_none() {
+                    let val = text.trim().to_string();
+                    if !val.is_empty() {
+                        resumption = Some(val);
+                    }
+                }
                 if local == "record" {
                     if let Some(r) = cur.take() {
                         records.push(r);
@@ -200,7 +274,7 @@ fn parse_oai(xml: &str) -> Result<Vec<OaiRecord>, FetchError> {
             _ => {}
         }
     }
-    Ok(records)
+    Ok((records, resumption))
 }
 
 fn local_name(qname: &[u8]) -> String {
@@ -245,11 +319,44 @@ mod tests {
   </record>
  </ListRecords>
 </OAI-PMH>"#;
-        let recs = parse_oai(xml).unwrap();
+        let (recs, token) = parse_oai(xml).unwrap();
         assert_eq!(recs.len(), 1);
         assert_eq!(recs[0].title, "Agentic retrieval methods");
         assert_eq!(recs[0].creators.len(), 2);
         assert_eq!(recs[0].identifier, "http://arxiv.org/abs/2401.00001v1");
         assert_eq!(arxiv_id_from_url(&recs[0].identifier).as_deref(), Some("2401.00001"));
+        assert!(token.is_none(), "토큰이 없는 응답은 마지막 페이지다");
+    }
+
+    #[test]
+    fn captures_resumption_token() {
+        // 0.1.x 는 이 토큰을 무시해 첫 페이지만 봤다.
+        let xml = r#"<?xml version="1.0"?>
+<OAI-PMH xmlns="http://www.openarchives.org/OAI/2.0/">
+ <ListRecords>
+  <record>
+   <header><identifier>oai:arXiv.org:2401.00002</identifier></header>
+   <metadata><oai_dc:dc xmlns:oai_dc="http://www.openarchives.org/OAI/2.0/oai_dc/" xmlns:dc="http://purl.org/dc/elements/1.1/">
+     <dc:title>Second</dc:title>
+     <dc:identifier>http://arxiv.org/abs/2401.00002v1</dc:identifier>
+   </oai_dc:dc></metadata>
+  </record>
+  <resumptionToken cursor="0" completeListSize="200">TOKEN-PAGE-2</resumptionToken>
+ </ListRecords>
+</OAI-PMH>"#;
+        let (recs, token) = parse_oai(xml).unwrap();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(token.as_deref(), Some("TOKEN-PAGE-2"));
+    }
+
+    #[test]
+    fn empty_resumption_token_means_last_page() {
+        let xml = r#"<?xml version="1.0"?>
+<OAI-PMH xmlns="http://www.openarchives.org/OAI/2.0/">
+ <ListRecords><resumptionToken completeListSize="1" cursor="0"></resumptionToken></ListRecords>
+</OAI-PMH>"#;
+        let (recs, token) = parse_oai(xml).unwrap();
+        assert!(recs.is_empty());
+        assert!(token.is_none());
     }
 }

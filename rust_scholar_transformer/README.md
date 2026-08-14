@@ -65,12 +65,12 @@ There is one boundary between the core and the caller: **can it be done determin
 ### Rust library
 
 ```rust
-use rust_scholar_transformer::{ArxivOaiSource, Engine, GoogleNewsSource, SearchQuery};
+use rust_scholar_transformer::{ArxivSource, Engine, GoogleNewsSource, SearchQuery};
 
 #[tokio::main]
 async fn main() {
     let mut engine = Engine::new();
-    engine.register(Box::new(ArxivOaiSource::new()));    // no key needed
+    engine.register(Box::new(ArxivSource::new()));       // no key needed
     engine.register(Box::new(GoogleNewsSource::new()));  // no key needed
 
     let report = engine.search(SearchQuery::from_text("agentic loop engineering", 20)).await;
@@ -95,6 +95,16 @@ r = Retriever(sources=["arxiv", "news"])          # works with zero keys
 report = json.loads(r.search("agentic loop engineering", limit=20))
 for d in report["docs"]:
     print(d["source"], d["title"], d["url"])
+for w in report["warnings"]:                      # includes sources that returned nothing
+    print("warning:", w["source"], w["message"])
+```
+
+Write focused queries. Terms are combined with `AND`, so a long natural-language sentence can legitimately
+return nothing. Use two or three keywords, or quote a phrase, and narrow by arXiv category when it helps:
+
+```python
+r = Retriever(sources=["arxiv"], arxiv_categories=["cs.CL", "eess.AS"])
+report = json.loads(r.search('"speaker diarization" whisper', limit=10))
 ```
 
 ---
@@ -252,8 +262,10 @@ A single source failing does not fail the whole search: the failure is reported 
 ### 6.4 Adapter Constructors
 
 ```rust
-ArxivOaiSource::new()                       // OAI-PMH (primary). .with_from_days(n) . .with_set("cs")
-ArxivSource::new()                          // live API (fallback). .with_retry(n, delay) . .with_user_agent(..)
+ArxivSource::new()                          // live search API (primary). .with_categories(vec!["cs.CL".into()])
+                                            //   . .with_retry(n, delay) . .with_user_agent(..)
+ArxivOaiSource::new()                       // OAI-PMH recent-window harvest (secondary).
+                                            //   .with_from_days(n) . .with_set("cs") . .with_max_pages(n)
 RssSource::new(vec![FeedSource::new("name", "url").with_reliability(0.95)])
 GoogleNewsSource::new()                     // .with_locale("ko", "KR", "KR:ko", "ko")
 YoutubeSource::new(api_key)                 // requires a Data API v3 key
@@ -275,8 +287,8 @@ MinIntervalLimiter::from_millis(ms)              // per-source minimum interval 
 
 | Source | Type / key | Status |
 |---|---|---|
-| arXiv (primary) | `ArxivOaiSource` / no key | harvests the last N days via OAI-PMH + in-memory keyword filter. No rate-limit exposure |
-| arXiv (fallback) | `ArxivSource` / no key | live search API. Pre-checks HTTP status + 429 backoff. A fallback due to shared-IP blocking risk |
+| arXiv (primary) | `ArxivSource` / no key | live search API over the whole archive. Phrase-aware `AND` query builder, optional `cat:` narrowing, HTTP status pre-check + 429 backoff |
+| arXiv (secondary) | `ArxivOaiSource` / no key | OAI-PMH harvest of the last N days + in-memory `AND` filter, optional `resumptionToken` paging. For sweeping a recent window by category, and as a fallback. Heavy: about 3.6 MB / 1300 records per page |
 | Blogs/RSS | `RssSource` / no key | concurrent fetch of subscribed feeds + keyword filter + per-feed reliability |
 | News | `GoogleNewsSource` / no key | Google News RSS search (public RSS, not an API) |
 | YouTube | `YoutubeSource` / **key required** | Data API v3 metadata. Does not handle captions (below) |
@@ -284,8 +296,10 @@ MinIntervalLimiter::from_millis(ms)              // per-source minimum interval 
 
 Verification and limitation notes:
 
-- **Free, keyless core.** arXiv (OAI-PMH) + Google News RSS + blog RSS work without an API key. Only YouTube and web need a key (optional); if you register them without a key, only that adapter is handled as a warning and the rest of the results return normally (graceful partial failure). Since no LLM is called, no LLM key is needed either.
-- **arXiv OAI-PMH is primary.** The live search API blocks even a polite client with persistent HTTP 429 (rate limit) from shared IPs. The OAI-PMH (Open Archives Initiative Protocol for Metadata Harvesting) mirror has no rate-limit exposure and reliably harvests recent papers.
+- **Free, keyless core.** arXiv + Google News RSS + blog RSS work without an API key. Only YouTube and web need a key (optional); if you register them without a key, only that adapter is handled as a warning and the rest of the results return normally (graceful partial failure). Since no LLM is called, no LLM key is needed either.
+- **The two arXiv paths answer different questions.** `ArxivSource` searches the entire archive and is what you want for "find papers about X". `ArxivOaiSource` cannot do that by construction: OAI-PMH (Open Archives Initiative Protocol for Metadata Harvesting) is a date-based harvest, so anything outside the recent window is unreachable no matter how the query is written. Reach for it when you want to sweep everything a category published in the last N days, or when the live API is unavailable. Note also that OAI `from` filters on the metadata **datestamp**, not the submission date, so an old paper whose metadata was touched will appear in a recent harvest.
+- **The OAI path is heavy, so it follows one page by default.** A single `ListRecords` page is roughly 3.6 MB and 1300 records; following three pages measured about 8.5 seconds end to end, which sits against the engine's 10-second per-source timeout. Raise `max_pages` only together with the timeout (`Engine::with_timeout`, or `timeout_secs=` from Python), and expect a source that exceeds it to be reported as a timeout warning rather than silently truncated.
+- **Query terms are combined with `AND`.** Quoted spans are kept as phrase searches. This favours precision, which means a long sentence pasted verbatim can legitimately return nothing. When a source returns nothing it says so in `warnings`, so an empty result is never silent.
 - **YouTube captions are not handled.** `captions.download` requires the video owner's permission, and unofficial extraction violates the terms of service. Only metadata (title, channel, description, publish date, URL) is handled.
 - **The web provider is replaceable.** The search supply chain changes often and is mostly paid, so it sits behind the `WebProvider` trait. Scraping-based providers carry legal risk, so they are kept separate from self-indexed or legal-API providers and used explicitly.
 - **Semantic re-ranking is outside the core.** Cross-encoders and the like require an external model and cross the model-free boundary, so the caller (LLM/Python) handles it, or you route around it with embeddings from Semantic Scholar.
@@ -346,12 +360,18 @@ maturin develop --features python
 import json
 from rust_scholar_transformer import Retriever
 
-# sources: "arxiv" | "news" | "blog" | "youtube" | "web" (default ["arxiv","news"])
+# sources: "arxiv" | "arxiv_oai" | "news" | "blog" | "youtube" | "web"
+#          (default ["arxiv","news"])
 r = Retriever(
     sources=["arxiv", "news", "blog", "youtube", "web"],
     rss_feeds=["https://aws.amazon.com/blogs/machine-learning/feed/"],
-    youtube_api_key="...",   # optional
-    brave_api_key="...",     # optional
+    youtube_api_key="...",      # optional
+    brave_api_key="...",        # optional
+    arxiv_categories=["cs.CL"], # optional, narrows the live arXiv search
+    arxiv_oai_set="cs",         # optional, only used by the "arxiv_oai" source
+    arxiv_oai_days=7,           # optional, harvest window for "arxiv_oai"
+    arxiv_oai_max_pages=1,      # optional, resumptionToken pages to follow
+    timeout_secs=10,            # optional, per-source timeout
 )
 report = json.loads(r.search("multi-agent RAG", limit=20))   # returns a JSON string
 ```
@@ -385,7 +405,7 @@ def answer(question: str, llm) -> str:
 
 ```rust
 let mut engine = Engine::new();
-engine.register(Box::new(ArxivOaiSource::new()));
+engine.register(Box::new(ArxivSource::new()));
 engine.register(Box::new(GoogleNewsSource::new()));
 let report = engine.search(SearchQuery::from_text(&q, 20)).await;
 // serialize report.docs directly as the response, or pass it as downstream LLM context
@@ -440,9 +460,14 @@ cargo build --features python
 # Test / lint
 cargo test
 cargo clippy --all-targets
+
+# Live smoke test against the real services (excluded from the default run)
+cargo test --test live_smoke -- --ignored --nocapture
 ```
 
-Integration tests mock HTTP responses with wiremock and verify deterministically (avoiding a live API dependency).
+Integration tests mock HTTP responses with wiremock and verify deterministically, so the default run has no live API dependency.
+
+**Run the live smoke test before a release.** Mocks verify that the parser handles a response; they cannot verify that the adapter builds a query the real service accepts. That gap is not theoretical: a recall defect in the arXiv path once passed the entire mocked suite while returning papers unrelated to the query. `tests/live_smoke.rs` closes it by asserting that a real query comes back on topic, that category narrowing does not silently empty the result, and that a nonsense query returns nothing at all.
 
 ---
 
@@ -463,7 +488,7 @@ Integration tests mock HTTP responses with wiremock and verify deterministically
   - `ratelimit.rs` (per-source minimum-interval limiter)
   - `python.rs` (PyO3 bindings, `python` feature)
   - `sources/` (arxiv, arxiv_oai, rss, news, youtube, web, feed_common)
-- `tests/` (deterministic integration tests over mocked HTTP)
+- `tests/` (deterministic integration tests over mocked HTTP, plus `live_smoke.rs` which is `#[ignore]` by default)
 - `.github/workflows/release.yml` (all-platform abi3 wheel build -> PyPI publish)
 
 ---

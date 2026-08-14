@@ -107,7 +107,13 @@ impl Engine {
         let mut warnings: Vec<ConnectorWarning> = Vec::new();
         for (kind, outcome) in outcomes {
             match outcome {
-                Ok(Ok(docs)) => per_source.push(docs),
+                Ok(Ok(docs)) => {
+                    // 0건은 실패가 아니지만 조용히 넘기면 "없었다"와 "안 돌았다"가 구분되지 않는다.
+                    if docs.is_empty() {
+                        warnings.push(ConnectorWarning::empty(kind));
+                    }
+                    per_source.push(docs);
+                }
                 Ok(Err(e)) => warnings.push(ConnectorWarning::new(kind, e.to_string())),
                 Err(_elapsed) => warnings.push(ConnectorWarning::timeout(kind)),
             }

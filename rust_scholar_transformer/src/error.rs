@@ -32,6 +32,12 @@ impl ConnectorWarning {
     pub fn timeout(source: SourceKind) -> Self {
         Self { source, message: "source timed out".to_string() }
     }
+
+    /// 소스가 정상 응답했지만 결과가 0건인 경우. 실패가 아니라 정보지만 경고로 올린다 —
+    /// 이게 없으면 호출자가 "이 소스에 없었다"와 "이 소스가 안 돌았다"를 구분할 수 없다.
+    pub fn empty(source: SourceKind) -> Self {
+        Self { source, message: "source returned 0 documents".to_string() }
+    }
 }
 
 /// 검색 결과 + 부분 실패 경고. 부분 실패를 조용히 버리지 않는다.

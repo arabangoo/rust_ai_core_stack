@@ -13,7 +13,8 @@ use pyo3::prelude::*;
 use pyo3::types::PyModule;
 
 use crate::sources::{
-    ArxivOaiSource, BraveProvider, FeedSource, GoogleNewsSource, RssSource, WebSource, YoutubeSource,
+    ArxivOaiSource, ArxivSource, BraveProvider, FeedSource, GoogleNewsSource, RssSource, WebSource,
+    YoutubeSource,
 };
 use crate::{Engine, SearchQuery};
 
@@ -26,23 +27,73 @@ struct Retriever {
 #[pymethods]
 impl Retriever {
     /// 소스 목록과 자격증명으로 리트리버를 만든다.
-    /// sources: "arxiv" | "news" | "blog" | "youtube" | "web" (기본 ["arxiv","news"]).
+    ///
+    /// sources: `"arxiv"` | `"arxiv_oai"` | `"news"` | `"blog"` | `"youtube"` | `"web"`
+    /// (기본 `["arxiv","news"]`).
+    ///
+    /// **0.2.0 의 동작 변경.** `"arxiv"` 가 이제 라이브 검색 API([`ArxivSource`])를 등록한다.
+    /// 0.1.x 에서는 OAI-PMH 수확기가 등록됐고, 그 경로는 최근 N일 창 밖을 원리적으로 찾지
+    /// 못해 일반 검색의 재현율이 사실상 0 이었다. 최근 구간 전량 모니터링이 필요하면
+    /// `"arxiv_oai"` 를 명시적으로 지정한다.
+    ///
+    /// - `arxiv_categories`: 라이브 API 의 분류 한정(예: `["cs.CL", "eess.AS"]`).
+    /// - `arxiv_oai_set`: OAI 경로의 set 한정(예: `"cs"`). 지정하지 않으면 전 분야를 수확한다.
+    /// - `arxiv_oai_days`: OAI 경로의 수확 창(기본 7일).
+    /// - `arxiv_oai_max_pages`: OAI 경로가 따라갈 페이지 수(기본 1). 페이지당 약 3.6MB /
+    ///   1300건이라 올리면 `timeout_secs` 도 함께 올려야 한다.
+    /// - `timeout_secs`: 소스별 타임아웃(기본 10초). OAI 를 여러 페이지 훑을 때 올린다.
     #[new]
-    #[pyo3(signature = (sources=None, rss_feeds=None, youtube_api_key=None, brave_api_key=None))]
+    #[pyo3(signature = (
+        sources=None,
+        rss_feeds=None,
+        youtube_api_key=None,
+        brave_api_key=None,
+        arxiv_categories=None,
+        arxiv_oai_set=None,
+        arxiv_oai_days=None,
+        arxiv_oai_max_pages=None,
+        timeout_secs=None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         sources: Option<Vec<String>>,
         rss_feeds: Option<Vec<String>>,
         youtube_api_key: Option<String>,
         brave_api_key: Option<String>,
+        arxiv_categories: Option<Vec<String>>,
+        arxiv_oai_set: Option<String>,
+        arxiv_oai_days: Option<i64>,
+        arxiv_oai_max_pages: Option<usize>,
+        timeout_secs: Option<u64>,
     ) -> PyResult<Self> {
         let rt = tokio::runtime::Runtime::new().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let mut engine = Engine::new();
+        if let Some(secs) = timeout_secs {
+            engine = engine.with_timeout(std::time::Duration::from_secs(secs.max(1)));
+        }
         let wanted = sources.unwrap_or_else(|| vec!["arxiv".to_string(), "news".to_string()]);
 
         for s in &wanted {
             match s.as_str() {
                 "arxiv" => {
-                    engine.register(Box::new(ArxivOaiSource::new()));
+                    let mut src = ArxivSource::new();
+                    if let Some(cats) = &arxiv_categories {
+                        src = src.with_categories(cats.clone());
+                    }
+                    engine.register(Box::new(src));
+                }
+                "arxiv_oai" => {
+                    let mut src = ArxivOaiSource::new();
+                    if let Some(set) = &arxiv_oai_set {
+                        src = src.with_set(set.clone());
+                    }
+                    if let Some(days) = arxiv_oai_days {
+                        src = src.with_from_days(days);
+                    }
+                    if let Some(pages) = arxiv_oai_max_pages {
+                        src = src.with_max_pages(pages);
+                    }
+                    engine.register(Box::new(src));
                 }
                 "news" => {
                     engine.register(Box::new(GoogleNewsSource::new()));

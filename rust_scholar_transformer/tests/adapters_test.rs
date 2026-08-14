@@ -74,6 +74,45 @@ async fn arxiv_oai_harvests_and_filters() {
     assert!(docs[0].published_at.is_some());
 }
 
+/// 0.1.x 회귀 방어. 필터가 OR 이던 시절에는 낱말 하나만 걸려도 통과해서 질의와 상관없는
+/// 레코드가 결과로 나왔다. 위 테스트는 단어 하나짜리 질의라 그 결함을 잡지 못했다.
+#[tokio::test]
+async fn arxiv_oai_requires_all_terms_not_any() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/oai"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(OAI))
+        .mount(&server)
+        .await;
+    let src = ArxivOaiSource::new().with_base_url(format!("{}/oai", server.uri()));
+
+    // "agentic" 은 1번 레코드에만, "recipes" 는 2번 레코드에만 있다.
+    // OR 이면 두 건이 다 나오고, AND 면 두 낱말을 함께 가진 레코드가 없어 0건이어야 한다.
+    let docs = src.search(&SearchQuery::from_text("agentic recipes", 20)).await.unwrap();
+    assert!(docs.is_empty(), "AND 매칭이면 교집합이 없어 0건이어야 한다");
+
+    // 같은 레코드 안에 둘 다 있는 조합은 정상적으로 잡힌다.
+    let docs = src.search(&SearchQuery::from_text("agentic retrieval", 20)).await.unwrap();
+    assert_eq!(docs.len(), 1);
+    assert_eq!(docs[0].identity.arxiv_id.as_deref(), Some("2401.00001"));
+}
+
+/// 두 글자 이하 토큰은 필터에서 뺀다. 안 그러면 관사·전치사 하나가 AND 조건을 무의미하게 만든다.
+#[tokio::test]
+async fn arxiv_oai_ignores_short_tokens() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/oai"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(OAI))
+        .mount(&server)
+        .await;
+    let src = ArxivOaiSource::new().with_base_url(format!("{}/oai", server.uri()));
+
+    // "of" 는 무시되고 "agentic" 만 조건으로 남는다.
+    let docs = src.search(&SearchQuery::from_text("of agentic", 20)).await.unwrap();
+    assert_eq!(docs.len(), 1);
+}
+
 #[tokio::test]
 async fn youtube_parses_metadata() {
     let server = MockServer::start().await;
