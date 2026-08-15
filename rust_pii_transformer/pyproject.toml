@@ -1,0 +1,37 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "rust_pii_transformer"
+description = "Deterministic Korean PII detection and masking with guaranteed source-offset recovery. Pure Rust, no models, no network."
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.9"
+authors = [{ name = "rust_pii_transformer contributors" }]
+keywords = ["pii", "korean", "masking", "privacy", "redaction"]
+classifiers = [
+    # 네 층이 다 돌지만 실세계 코퍼스 검증이 없으므로 아직 Alpha 로 둔다.
+    "Development Status :: 3 - Alpha",
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: Apache Software License",
+    "Topic :: Text Processing :: Linguistic",
+    "Topic :: Security",
+    "Natural Language :: Korean",
+]
+# version 은 Cargo.toml 의 package.version 에서 자동으로 가져온다 (dynamic).
+dynamic = ["version"]
+
+[project.urls]
+Repository = "https://github.com/arabangoo/rust_pii_transformer"
+
+[tool.maturin]
+# Rust 의 #[pymodule] 함수명 = cdylib 이름과 일치해야 한다.
+module-name = "rust_pii_transformer"
+# Python 바인딩(cdylib) 활성 feature. 코어는 default 로 항상 빌드된다.
+#
+# hash 를 함께 켜는 이유는 휠이 배포 산출물이기 때문이다. Rust 소비자는 feature 를 골라
+# 다시 빌드할 수 있지만 휠을 받는 사람은 그럴 수 없다. 정책 4종이 다 들어 있어야 한다.
+features = ["python", "hash"]
+# abi3(stable ABI) 휠 → Python 3.9+ 단일 휠로 호환.
